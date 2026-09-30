@@ -65,16 +65,23 @@
 git clone https://github.com/suuu-u/Learn_SO101.git
 cd Learn_SO101
 conda create -n lerobot python=3.12 -y && conda activate lerobot
+conda install ffmpeg -c conda-forge -y   # 视频编解码（录制 / 读取数据集需要），也可用 sudo apt install ffmpeg
 bash setup.sh            # 生成 ./lerobot 并安装；NO_INSTALL=1 bash setup.sh 只克隆不安装
 cd lerobot               # 以下所有命令都在这里执行
 ```
+
+`setup.sh` 会克隆 LeRobot@4aaff99b、覆盖本仓库文件，并用 pip 安装：
+
+- LeRobot 本体（可编辑安装）及 extras：`core_scripts`（录制 / 遥操作工具、pynput、rerun）、`feetech`（SO101 舵机）、`hilserl`（gym-hil、placo、gRPC）、`smolvla`（transformers）
+- 额外的 `mujoco==3.8.1`、`wandb`、`imageio`、`pytest`
+
+PyTorch 由 pip 自动安装（2.11，CUDA 13 版本），需要 NVIDIA 驱动 ≥ 580（`nvidia-smi` 右上角查看）。驱动较旧时，先按 [pytorch.org](https://pytorch.org/get-started/locally/) 装与驱动匹配的 torch / torchvision，再运行 `setup.sh`。
 
 配置里的 `Simulation/SO101/...`、`outputs/...` 都是相对 `lerobot/` 根目录的路径。
 
 ### 0.2 验证安装
 
 ```bash
-pip install pytest
 pytest tests/rl/test_so101_mujoco.py -v
 ```
 

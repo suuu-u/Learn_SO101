@@ -26,8 +26,10 @@ cp -r "$HERE/overlay/." "$TARGET/"
 echo "Copied $(find "$HERE/overlay" -type f | wc -l) files into $TARGET (lerobot @ ${LEROBOT_COMMIT:0:8})"
 
 if [ -z "${NO_INSTALL:-}" ]; then
-    pip install -e "$TARGET[feetech,hilserl,smolvla]"
-    pip install mujoco placo wandb imageio
+    # core_scripts: recording / teleop tools (pynput keyboard, rerun viewer, datasets)
+    # feetech: SO101 motors; hilserl: gym-hil, placo IK, gRPC; smolvla: transformers
+    pip install -e "$TARGET[core_scripts,feetech,hilserl,smolvla]"
+    pip install "mujoco==3.8.1" wandb imageio pytest
 fi
 
 echo "Done. Run the commands in README.md from: $TARGET"
