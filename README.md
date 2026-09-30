@@ -8,8 +8,6 @@
 
 任务：`pick up the black cubic to the circle`（把黑色方块夹起放进圆圈），控制频率 10 fps。
 
-> English: RL code and configs for the SO-101 arm on top of LeRobot — HIL-SERL (real + MuJoCo sim), a privileged PPO teacher distilled into a camera-only student for sim2real, and ACT / SmolVLA baselines. Run `bash setup.sh`, then follow the commands below.
-
 ## 仓库结构
 
 本仓库不是 LeRobot 的完整副本，只包含**新增和修改过的文件**，按 LeRobot 的目录结构放在 `overlay/` 下；`setup.sh` 会把 LeRobot 固定到上游 commit [`4aaff99b`](https://github.com/huggingface/lerobot/commit/4aaff99be4a1d81568c08c8f0296b41b40c99ec4) 并覆盖这些文件。
@@ -45,17 +43,15 @@
 | `so101_mujoco/ppo_realscene.yaml` | PPO 教师训练（`teacher_realscene.pt` 的原始配置） |
 | `so101_mujoco/distill_realcam.yaml` | DAgger 蒸馏（`student_realcam.pt` 的原始配置） |
 
-## 已发布的模型与数据（Hugging Face）
+## 模型与数据（Hugging Face）
 
 | Hub 仓库 | 内容 |
 |---|---|
-| [`suuu3/so101_mujoco_sim2real`](https://huggingface.co/suuu3/so101_mujoco_sim2real) | `teacher_robust_best.pt`、`teacher_realscene.pt`（PPO 教师），`student_realcam.pt`（视觉学生，用于部署），以及训练 config / metrics |
+| [`suuu3/so101_mujoco_sim2real`](https://huggingface.co/suuu3/so101_mujoco_sim2real) | `teacher_realscene.pt`（PPO 教师），`student_realcam.pt`（视觉学生，用于部署），以及训练 config / metrics |
 | [`suuu3/so101_reward_classifier`](https://huggingface.co/suuu3/so101_reward_classifier) | HIL-SERL 奖励分类器 |
 | [`suuu3/so101_act_test3`](https://huggingface.co/suuu3/so101_act_test3) | ACT（40k steps） |
 | [`suuu3/so101_smolvla_test3`](https://huggingface.co/suuu3/so101_smolvla_test3) | SmolVLA（基于 `lerobot/smolvla_base` 微调 20k steps） |
 | [`suuu3/so101_test3`](https://huggingface.co/datasets/suuu3/so101_test3)（dataset） | ACT / SmolVLA 训练数据，50 条示范 |
-
-HIL-SERL 的录制数据与 SAC 策略未发布；配置中以 `YOUR_HF_USER/...` 表示，需自行录制（见 1.1）。
 
 国内网络可用镜像下载：`export HF_ENDPOINT=https://hf-mirror.com`。
 
