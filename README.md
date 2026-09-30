@@ -92,8 +92,6 @@ pytest tests/rl/test_so101_mujoco.py -v
 - 域随机化：物理参数按环境独立随机且可还原，动作延迟、关节读数噪声、相机延迟生效
 - 网络与部署：教师 / 学生网络的输入输出维度，部署前的 env 配置一致性检查
 
-若显示 `SKIPPED`，说明 `mujoco` 或 `placo` 没有装好；若有 `FAILED`，多半是依赖版本与原实验环境不一致，可对照 `extras/environment/pip_freeze.txt`。这些测试只覆盖仿真部分，真机相关功能需要按下面的说明接好硬件后再验证。
-
 ### 0.3 硬件与配置准备
 
 **只用仿真时**无需任何硬件；leader 臂接管需要一个 SO101 leader（或把 `teleop` 改成 `keyboard_hil`）。
@@ -107,7 +105,7 @@ pytest tests/rl/test_so101_mujoco.py -v
 
 ## 1. 模仿学习基线（ACT / SmolVLA）
 
-使用 SO101 follower + leader 臂遥操作采集示范，前置（`front`）与侧面（`side`）两个 640×480 相机，30 fps。已发布的数据集 `suuu3/so101_test3` 为 50 条示范，可跳过 1.1 直接训练。
+使用 SO101 follower + leader 臂遥操作采集示范，前置（`front`）与侧面（`side`）两个 640×480 相机，25和30 fps。已发布的数据集 `suuu3/so101_test3` 为 50 条示范，可跳过 1.1 直接训练。
 
 ### 1.1 采集示范数据
 
