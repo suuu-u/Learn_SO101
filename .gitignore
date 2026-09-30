@@ -1,0 +1,7 @@
+# LeRobot checkout created by setup.sh
+/lerobot/
+outputs/
+wandb/
+__pycache__/
+*.pyc
+.DS_Store

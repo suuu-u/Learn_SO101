@@ -1,0 +1,2846 @@
+diff --git a/src/lerobot/envs/configs.py b/src/lerobot/envs/configs.py
+index 0c3075b4..e7625068 100644
+--- a/src/lerobot/envs/configs.py
++++ b/src/lerobot/envs/configs.py
+@@ -281,12 +281,34 @@ class GripperConfig:
+ class ResetConfig:
+     """Configuration for environment reset behavior."""
+ 
+-    fixed_reset_joint_positions: Any | None = None
++    fixed_reset_joint_positions: list[float] | None = None
+     reset_time_s: float = 5.0
+     control_time_s: float = 20.0
+     terminate_on_success: bool = True
+ 
+ 
++@dataclass
++class StagedRewardConfig:
++    """Potential-based shaping from proprioception only (works identically in sim and on the real robot).
++
++    Progress Φ: 0 = not holding, `grasp_reward` = grasped (last gripper command was "close" and the
++    gripper stopped above `grasp_min_gripper_pos`, i.e. something is between the jaws),
++    `lift_reward` = grasped and end-effector higher than `lift_height`. Each step adds
++    discount·Φ(s') − Φ(s), which does not change the optimal policy (Ng et al., 1999).
++    """
++
++    grasp_reward: float = 0.1
++    lift_reward: float = 0.3
++    # Gripper position (0 = closed, 100 = open) above which a "close" command means the jaws are
++    # blocked by an object. An empty closed gripper reads ~0; holding the 2 cm sim cube reads 5-8
++    # and the real cube ~5, so 2.5 separates both.
++    grasp_min_gripper_pos: float = 2.5
++    # End-effector height (m, robot base frame) above which a grasped object counts as lifted
++    lift_height: float = 0.05
++    # Must equal the RL discount (algorithm.discount)
++    discount: float = 0.97
++
++
+ @dataclass
+ class HILSerlProcessorConfig:
+     """Configuration for environment processing pipeline."""
+@@ -298,6 +320,7 @@ class HILSerlProcessorConfig:
+     reset: ResetConfig | None = None
+     inverse_kinematics: InverseKinematicsConfig | None = None
+     reward_classifier: RewardClassifierConfig | None = None
++    staged_reward: StagedRewardConfig | None = None
+     max_gripper_pos: float | None = 100.0
+ 
+ 
+diff --git a/src/lerobot/policies/gaussian_actor/configuration_gaussian_actor.py b/src/lerobot/policies/gaussian_actor/configuration_gaussian_actor.py
+index cfc92600..8bf2cc2d 100644
+--- a/src/lerobot/policies/gaussian_actor/configuration_gaussian_actor.py
++++ b/src/lerobot/policies/gaussian_actor/configuration_gaussian_actor.py
+@@ -79,6 +79,9 @@ class PolicyConfig:
+     std_min: float = 1e-5
+     std_max: float = 10.0
+     init_final: float = 0.05
++    # Scales the policy's continuous actions from (-1, 1) to (-action_scale, action_scale), e.g. 0.5
++    # halves the speed of autonomous exploration. Teleop/demo actions are not affected.
++    action_scale: float = 1.0
+ 
+ 
+ @PreTrainedConfig.register_subclass("gaussian_actor")
+diff --git a/src/lerobot/policies/gaussian_actor/modeling_gaussian_actor.py b/src/lerobot/policies/gaussian_actor/modeling_gaussian_actor.py
+index a833d01c..f7dcc29d 100644
+--- a/src/lerobot/policies/gaussian_actor/modeling_gaussian_actor.py
++++ b/src/lerobot/policies/gaussian_actor/modeling_gaussian_actor.py
+@@ -410,6 +410,7 @@ class Policy(nn.Module):
+         init_final: float | None = None,
+         use_tanh_squash: bool = False,
+         encoder_is_shared: bool = False,
++        action_scale: float = 1.0,
+     ):
+         super().__init__()
+         self.encoder: GaussianActorObservationEncoder = encoder
+@@ -420,6 +421,7 @@ class Policy(nn.Module):
+         self.fixed_std = fixed_std
+         self.use_tanh_squash = use_tanh_squash
+         self.encoder_is_shared = encoder_is_shared
++        self.action_scale = action_scale
+ 
+         # Find the last Linear layer's output dimension
+         for layer in reversed(network.net):
+@@ -473,6 +475,11 @@ class Policy(nn.Module):
+         # Compute log_probs
+         log_probs = dist.log_prob(actions)
+ 
++        # Scale after the log-prob so entropy (and temperature tuning) stay measured in the (-1, 1)
++        # tanh space; actor and learner both see the scaled, actually executed actions
++        if self.action_scale != 1.0:
++            actions = actions * self.action_scale
++
+         return actions, log_probs, means
+ 
+     def get_features(self, observations: torch.Tensor) -> torch.Tensor:
+diff --git a/src/lerobot/processor/__init__.py b/src/lerobot/processor/__init__.py
+index 6ed762b6..66080645 100644
+--- a/src/lerobot/processor/__init__.py
++++ b/src/lerobot/processor/__init__.py
+@@ -62,7 +62,10 @@ from .hil_processor import (
+     GymHILAdapterProcessorStep,
+     ImageCropResizeProcessorStep,
+     InterventionActionProcessorStep,
++    LeaderArmTeleopStep,
++    LeaderJointPassthroughStep,
+     RewardClassifierProcessorStep,
++    StagedRewardProcessorStep,
+     TimeLimitProcessorStep,
+ )
+ from .newline_task_processor import NewLineTaskProcessorStep
+@@ -133,6 +136,8 @@ __all__ = [
+     "ImageCropResizeProcessorStep",
+     "InfoProcessorStep",
+     "InterventionActionProcessorStep",
++    "LeaderArmTeleopStep",
++    "LeaderJointPassthroughStep",
+     "DefaultPolicyProcessorSteps",
+     "make_default_policy_processor_steps",
+     "make_default_pre_post_processors",
+@@ -161,6 +166,7 @@ __all__ = [
+     "rename_stats",
+     "RenameObservationsProcessorStep",
+     "RewardClassifierProcessorStep",
++    "StagedRewardProcessorStep",
+     "RewardProcessorStep",
+     "DataProcessorPipeline",
+     "IsaaclabArenaProcessorStep",
+diff --git a/src/lerobot/processor/hil_processor.py b/src/lerobot/processor/hil_processor.py
+index e0c9fe73..7e10836d 100644
+--- a/src/lerobot/processor/hil_processor.py
++++ b/src/lerobot/processor/hil_processor.py
+@@ -14,6 +14,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import logging
+ import math
+ import time
+ from dataclasses import dataclass
+@@ -27,12 +28,16 @@ from lerobot.configs import PipelineFeatureType, PolicyFeature
+ from lerobot.teleoperators.utils import TeleopEvents
+ 
+ if TYPE_CHECKING:
++    from lerobot.model.kinematics import RobotKinematics
+     from lerobot.teleoperators.teleoperator import Teleoperator
+ 
+ from lerobot.lerobot_types import EnvTransition, PolicyAction, TransitionKey
++from lerobot.utils.constants import OBS_IMAGE
+ 
++from .converters import batch_to_transition, transition_to_batch
+ from .pipeline import (
+     ComplementaryDataProcessorStep,
++    DataProcessorPipeline,
+     InfoProcessorStep,
+     ObservationProcessorStep,
+     ProcessorStep,
+@@ -43,6 +48,7 @@ from .pipeline import (
+ GRIPPER_KEY = "gripper"
+ DISCRETE_PENALTY_KEY = "discrete_penalty"
+ TELEOP_ACTION_KEY = "teleop_action"
++LEADER_JOINT_ACTION_KEY = "leader_joint_action"
+ 
+ 
+ @runtime_checkable
+@@ -140,13 +146,19 @@ class AddTeleopEventsAsInfoStep(InfoProcessorStep):
+     Attributes:
+         teleop_device: An instance of a teleoperator that implements the
+                        `HasTeleopEvents` protocol.
++        latch_success: If True, a success event stays set for the rest of the episode (until
++                       `reset()`), so every frame after the success key press is labeled as a
++                       success. Useful for collecting reward classifier data when episodes do not
++                       terminate on success.
+     """
+ 
+     teleop_device: TeleopWithEvents
++    latch_success: bool = False
+ 
+     def __post_init__(self):
+         """Validates that the provided teleoperator supports events after initialization."""
+         _check_teleop_with_events(self.teleop_device)
++        self._success_latched = False
+ 
+     def info(self, info: dict) -> dict:
+         """
+@@ -160,10 +172,16 @@ class AddTeleopEventsAsInfoStep(InfoProcessorStep):
+         """
+         new_info = dict(info)
+ 
+-        teleop_events = self.teleop_device.get_teleop_events()
++        teleop_events = dict(self.teleop_device.get_teleop_events())
++        if self.latch_success:
++            self._success_latched = self._success_latched or bool(teleop_events.get(TeleopEvents.SUCCESS))
++            teleop_events[TeleopEvents.SUCCESS] = self._success_latched
+         new_info.update(teleop_events)
+         return new_info
+ 
++    def reset(self) -> None:
++        self._success_latched = False
++
+     def transform_features(
+         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+     ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+@@ -446,6 +464,258 @@ class GripperPenaltyProcessorStep(ProcessorStep):
+         return features
+ 
+ 
++@dataclass
++class LeaderArmTeleopStep(ProcessorStep):
++    """
++    Lets a leader arm (e.g. SO101 leader) drive HIL-SERL interventions.
++
++    The follower is driven with the leader's joint positions (see `LeaderJointPassthroughStep`), the
++    way `lerobot-teleoperate` does. What gets recorded is the same `[delta_x, delta_y, delta_z,
++    gripper]` action the SAC policy outputs: the leader's end-effector displacement since the last
++    command, computed with forward kinematics, plus a discrete gripper command.
++
++    While not intervening, the leader's torque is enabled and it tracks the follower, so taking
++    over starts from the follower's current pose. When intervention starts, torque is released
++    so the human can move the leader freely.
++
++    With `clutch=True` the leader is instead used like a 3D mouse and never tracks the follower
++    (its torque stays off). Taking over anchors the leader's current end-effector position to the
++    follower's; from then on the follower target is its anchor plus the leader's displacement since
++    the anchor, reached through the same rate-limited EE deltas the policy uses. There is no jump
++    at takeover and the recorded action is the motion actually executed. The gripper keeps its
++    state at takeover (holding keeps squeezing) until the leader gripper crosses the threshold.
++
++    Must be placed after `AddTeleopActionAsComplimentaryDataStep` and `AddTeleopEventsAsInfoStep`
++    and before `InterventionActionProcessorStep`. The transition observation must hold the
++    follower's raw joint positions (`"<motor>.pos"`).
++
++    Attributes:
++        teleop_device: The leader arm teleoperator.
++        kinematics: Kinematics solver of the follower robot.
++        motor_names: Ordered motor names shared by leader and follower.
++        end_effector_step_sizes: Max EE displacement per step for x, y, z (meters); a delta of
++            1.0 corresponds to one step size.
++        max_gripper_pos: Gripper position the follower closes to; half of it is the threshold
++            used to decide the discrete gripper command.
++        use_gripper: Whether to append a discrete gripper command (0 opens, 1 stays, 2 closes).
++        clutch: Relative ("clutch") control instead of copying the leader's absolute pose.
++    """
++
++    teleop_device: "Teleoperator"
++    kinematics: "RobotKinematics"
++    motor_names: list[str]
++    end_effector_step_sizes: dict[str, float]
++    max_gripper_pos: float = 100.0
++    use_gripper: bool = True
++    clutch: bool = False
++
++    def __post_init__(self):
++        self._step_sizes = np.array([self.end_effector_step_sizes[axis] for axis in ("x", "y", "z")])
++        self._leader_torque_enabled: bool | None = None
++        self._was_intervening = False
++        self._leader_anchor: np.ndarray | None = None
++        self._follower_anchor: np.ndarray | None = None
++        self._leader_gripper_closed: bool | None = None
++        self._gripper_command: float | None = None
++
++    def _set_leader_tracking(self, tracking: bool, follower_joints: dict[str, float]) -> None:
++        if tracking != self._leader_torque_enabled:
++            if tracking:
++                self.teleop_device.enable_torque()
++            else:
++                self.teleop_device.disable_torque()
++            self._leader_torque_enabled = tracking
++        if tracking:
++            self.teleop_device.send_feedback(follower_joints)
++
++    def _gripper_action(self, leader_pos: float, follower_pos: float) -> float:
++        # GripperVelocityToJoint (discrete) moves the gripper to a limit:
++        # 0 drives the position up to max_gripper_pos, 2 drives it down to 0, 1 holds.
++        threshold = self.max_gripper_pos / 2
++        if leader_pos > threshold and follower_pos <= threshold:
++            return 0.0
++        if leader_pos <= threshold and follower_pos > threshold:
++            return 2.0
++        return 1.0
++
++    def __call__(self, transition: EnvTransition) -> EnvTransition:
++        complementary_data = transition.get(TransitionKey.COMPLEMENTARY_DATA) or {}
++        leader_action = complementary_data.get(TELEOP_ACTION_KEY)
++        observation = transition.get(TransitionKey.OBSERVATION) or {}
++        if not isinstance(leader_action, dict) or not observation:
++            return transition
++
++        follower_joints = {f"{m}.pos": float(observation[f"{m}.pos"]) for m in self.motor_names}
++        is_intervention = transition.get(TransitionKey.INFO, {}).get(TeleopEvents.IS_INTERVENTION, False)
++        # In clutch mode the leader never tracks the follower: its torque stays off
++        self._set_leader_tracking(not is_intervention and not self.clutch, follower_joints)
++
++        # The delta is measured from the last joint command (the previous IK solution, or the previous
++        # leader pose while intervening), the same reference EEReferenceAndDelta adds deltas to.
++        # Measuring it from the lagging follower instead would integrate the tracking error.
++        reference_q = complementary_data.get("IK_solution")
++        if reference_q is None:
++            reference_q = [follower_joints[f"{m}.pos"] for m in self.motor_names]
++        leader_q = np.array([float(leader_action[f"{m}.pos"]) for m in self.motor_names])
++        leader_ee = self.kinematics.forward_kinematics(leader_q)[:3, 3]
++        reference_ee = self.kinematics.forward_kinematics(np.asarray(reference_q, dtype=float))[:3, 3]
++        leader_gripper = float(leader_action[f"{GRIPPER_KEY}.pos"])
++        follower_gripper = follower_joints[f"{GRIPPER_KEY}.pos"]
++
++        if self.clutch:
++            delta, gripper = self._clutch_action(
++                is_intervention, leader_ee, reference_ee, leader_gripper, follower_gripper
++            )
++        else:
++            delta = np.clip((leader_ee - reference_ee) / self._step_sizes, -1.0, 1.0)
++            gripper = self._gripper_action(leader_gripper, follower_gripper)
++
++        ee_action = {"delta_x": float(delta[0]), "delta_y": float(delta[1]), "delta_z": float(delta[2])}
++        if self.use_gripper:
++            ee_action[GRIPPER_KEY] = gripper
++
++        new_transition = transition.copy()
++        new_complementary_data = dict(complementary_data)
++        new_complementary_data[TELEOP_ACTION_KEY] = ee_action
++        new_complementary_data[LEADER_JOINT_ACTION_KEY] = dict(leader_action)
++        new_transition[TransitionKey.COMPLEMENTARY_DATA] = new_complementary_data
++        return new_transition
++
++    def _clutch_action(
++        self,
++        is_intervention: bool,
++        leader_ee: np.ndarray,
++        reference_ee: np.ndarray,
++        leader_gripper: float,
++        follower_gripper: float,
++    ) -> tuple[np.ndarray, float]:
++        threshold = self.max_gripper_pos / 2
++        leader_closed = leader_gripper <= threshold
++        if is_intervention and not self._was_intervening:
++            # Engage the clutch: from here on only the leader's motion counts, not its pose
++            self._leader_anchor = leader_ee
++            self._follower_anchor = reference_ee
++            self._leader_gripper_closed = leader_closed
++            self._gripper_command = None
++        self._was_intervening = is_intervention
++        if not is_intervention:
++            return np.zeros(3), 1.0
++
++        target = self._follower_anchor + (leader_ee - self._leader_anchor)
++        delta = np.clip((target - reference_ee) / self._step_sizes, -1.0, 1.0)
++
++        # The gripper follows the leader only once the leader gripper crosses the threshold
++        if leader_closed != self._leader_gripper_closed:
++            self._gripper_command = 2.0 if leader_closed else 0.0
++            self._leader_gripper_closed = leader_closed
++        if self._gripper_command is not None:
++            gripper = self._gripper_command
++        else:
++            # Keep the state at takeover; a closed (e.g. holding) gripper keeps squeezing
++            gripper = 2.0 if follower_gripper <= threshold else 1.0
++        return delta, gripper
++
++    def reset(self) -> None:
++        # Re-sync the torque state on the next step (the env reset may have moved the follower).
++        self._leader_torque_enabled = None
++        # The follower was reset: re-anchor the clutch on the next intervening step
++        self._was_intervening = False
++
++    def get_config(self) -> dict[str, Any]:
++        return {
++            "motor_names": self.motor_names,
++            "end_effector_step_sizes": self.end_effector_step_sizes,
++            "max_gripper_pos": self.max_gripper_pos,
++            "use_gripper": self.use_gripper,
++            "clutch": self.clutch,
++        }
++
++    def transform_features(
++        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
++    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
++        return features
++
++
++@dataclass
++class LeaderJointPassthroughStep(ProcessorStep):
++    """
++    During a leader-arm intervention, sends the leader's joint positions straight to the follower,
++    the same way `lerobot-teleoperate` does (`robot.send_action(teleop.get_action())`).
++
++    The follower copies the leader exactly (wrist orientation included) instead of following the IK
++    solution of the recorded EE delta. The gripper is clipped to `[0, max_gripper_pos]`, the range
++    the policy's discrete gripper command can reach. When the leader leaves the end-effector
++    bounds, the follower falls back to the clipped IK command and waits at the edge of the
++    workspace, so it is always inside the bounds when control is handed back.
++
++    While the leader drives the follower, the kinematic steps are reset every step so they restart
++    from the leader's pose (published as `IK_solution`) instead of their stale pre-intervention
++    command.
++
++    Must be placed after `InverseKinematicsRLStep` and before
++    `RobotActionToPolicyActionProcessorStep`.
++
++    Attributes:
++        kinematics: Kinematics solver of the follower robot.
++        motor_names: Ordered motor names shared by leader and follower.
++        end_effector_bounds: The `min`/`max` EE position bounds of the workspace.
++        max_gripper_pos: Upper gripper position limit.
++        kinematic_steps: The pipeline's EEReferenceAndDelta, EEBoundsAndSafety and
++            InverseKinematicsRLStep steps.
++    """
++
++    kinematics: "RobotKinematics"
++    motor_names: list[str]
++    end_effector_bounds: dict[str, list[float]]
++    max_gripper_pos: float
++    kinematic_steps: list[ProcessorStep]
++
++    def __call__(self, transition: EnvTransition) -> EnvTransition:
++        is_intervention = transition.get(TransitionKey.INFO, {}).get(TeleopEvents.IS_INTERVENTION, False)
++        complementary_data = transition.get(TransitionKey.COMPLEMENTARY_DATA) or {}
++        leader_action = complementary_data.get(LEADER_JOINT_ACTION_KEY)
++        if not is_intervention or not isinstance(leader_action, dict):
++            return transition
++
++        leader_q = np.array([float(leader_action[f"{m}.pos"]) for m in self.motor_names])
++        leader_pos = self.kinematics.forward_kinematics(leader_q)[:3, 3]
++        if np.any(leader_pos < self.end_effector_bounds["min"]) or np.any(
++            leader_pos > self.end_effector_bounds["max"]
++        ):
++            # Leader is outside the workspace: keep the IK command, which the bounds step clipped
++            return transition
++
++        if GRIPPER_KEY in self.motor_names:
++            gripper_idx = self.motor_names.index(GRIPPER_KEY)
++            leader_q[gripper_idx] = np.clip(leader_q[gripper_idx], 0.0, self.max_gripper_pos)
++
++        new_transition = transition.copy()
++        action = dict(transition.get(TransitionKey.ACTION) or {})
++        for name, q in zip(self.motor_names, leader_q, strict=True):
++            action[f"{name}.pos"] = float(q)
++        new_transition[TransitionKey.ACTION] = action
++
++        new_complementary_data = dict(complementary_data)
++        new_complementary_data["IK_solution"] = leader_q
++        new_transition[TransitionKey.COMPLEMENTARY_DATA] = new_complementary_data
++
++        for step in self.kinematic_steps:
++            step.reset()
++        return new_transition
++
++    def get_config(self) -> dict[str, Any]:
++        return {
++            "motor_names": self.motor_names,
++            "end_effector_bounds": self.end_effector_bounds,
++            "max_gripper_pos": self.max_gripper_pos,
++        }
++
++    def transform_features(
++        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
++    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
++        return features
++
++
+ @dataclass
+ @ProcessorStepRegistry.register("intervention_action_processor")
+ class InterventionActionProcessorStep(ProcessorStep):
+@@ -573,9 +843,11 @@ class RewardClassifierProcessorStep(ProcessorStep):
+     terminate_on_success: bool = True
+ 
+     reward_classifier: Any = None
++    classifier_preprocessor: Any = None
+ 
+     def __post_init__(self):
+         """Initializes the reward classifier model after the dataclass is created."""
++        self._last_success = False
+         if self.pretrained_path is not None:
+             from lerobot.rewards.classifier.modeling_classifier import Classifier
+ 
+@@ -583,6 +855,15 @@ class RewardClassifierProcessorStep(ProcessorStep):
+             self.reward_classifier.to(self.device)
+             self.reward_classifier.eval()
+ 
++            # Apply the same normalization the classifier was trained with, and move images to its device
++            self.classifier_preprocessor = DataProcessorPipeline.from_pretrained(
++                self.pretrained_path,
++                config_filename="classifier_preprocessor.json",
++                overrides={"device_processor": {"device": self.device}},
++                to_transition=batch_to_transition,
++                to_output=transition_to_batch,
++            )
++
+     def __call__(self, transition: EnvTransition) -> EnvTransition:
+         """
+         Processes a transition, applying the reward classifier to its image observations.
+@@ -608,15 +889,32 @@ class RewardClassifierProcessorStep(ProcessorStep):
+         # Run reward classifier
+         start_time = time.perf_counter()
+         with torch.inference_mode():
+-            success = self.reward_classifier.predict_reward(images, threshold=self.success_threshold)
++            images = self.classifier_preprocessor(images)
++            image_inputs = [
++                images[key] for key in self.reward_classifier.config.input_features if key.startswith(OBS_IMAGE)
++            ]
++            probabilities = self.reward_classifier.predict(image_inputs).probabilities
++            if self.reward_classifier.config.num_classes == 2:
++                success_probability = float(probabilities.flatten()[0])
++                success = float(success_probability > self.success_threshold)
++            else:
++                success_probability = float(probabilities.flatten()[-1])
++                success = float(torch.argmax(probabilities, dim=-1).flatten()[0])
+ 
+         classifier_frequency = 1 / (time.perf_counter() - start_time)
+ 
++        is_success = math.isclose(success, 1, abs_tol=1e-2)
++        if is_success != self._last_success:
++            logging.info(
++                f"Reward classifier: {'SUCCESS' if is_success else 'no success'} (p={success_probability:.2f})"
++            )
++            self._last_success = is_success
++
+         # Calculate reward and termination
+         reward = new_transition.get(TransitionKey.REWARD, 0.0)
+         terminated = new_transition.get(TransitionKey.DONE, False)
+ 
+-        if math.isclose(success, 1, abs_tol=1e-2):
++        if is_success:
+             reward = self.success_reward
+             if self.terminate_on_success:
+                 terminated = True
+@@ -628,6 +926,7 @@ class RewardClassifierProcessorStep(ProcessorStep):
+         # Update info with classifier frequency
+         info = new_transition.get(TransitionKey.INFO, {})
+         info["reward_classifier_frequency"] = classifier_frequency
++        info["reward_classifier_probability"] = success_probability
+         new_transition[TransitionKey.INFO] = info
+ 
+         return new_transition
+@@ -650,3 +949,165 @@ class RewardClassifierProcessorStep(ProcessorStep):
+         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+     ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+         return features
++
++
++# Gripper motion (robot units per step) below which a closing gripper counts as stopped
++GRASP_STALL_TOLERANCE = 1.0
++
++
++def grasp_progress(
++    joint_positions: np.ndarray,
++    closing: bool,
++    kinematics: Any,
++    grasp_min_gripper_pos: float,
++    lift_height: float,
++    grasp_reward: float,
++    lift_reward: float,
++    previous_gripper_pos: float | None = None,
++) -> float:
++    """Task-progress potential Φ from proprioception only (joints in robot units, gripper last).
++
++    Grasped = the last gripper command was "close" and the gripper stopped (moved less than
++    `GRASP_STALL_TOLERANCE` since `previous_gripper_pos`) above `grasp_min_gripper_pos`: the jaws are
++    blocked by an object. Lifted = grasped and the end-effector is higher than `lift_height`.
++    """
++    if not closing or joint_positions[-1] <= grasp_min_gripper_pos:
++        return 0.0
++    if previous_gripper_pos is not None and abs(joint_positions[-1] - previous_gripper_pos) > GRASP_STALL_TOLERANCE:
++        # Still closing: not blocked by anything yet
++        return 0.0
++    ee_z = kinematics.forward_kinematics(np.asarray(joint_positions, dtype=float))[2, 3]
++    return lift_reward if ee_z > lift_height else grasp_reward
++
++
++def update_closing_intent(closing: bool, gripper_command: float) -> bool:
++    """Latch the last non-"stay" discrete gripper command (on SO101: 2 closes, 0 opens, 1 stays)."""
++    if gripper_command > 1.5:
++        return True
++    if gripper_command < 0.5:
++        return False
++    return closing
++
++
++def staged_shaping_for_trajectories(
++    joint_positions: np.ndarray,
++    gripper_commands: np.ndarray,
++    dones: np.ndarray,
++    kinematics: Any,
++    grasp_min_gripper_pos: float,
++    lift_height: float,
++    grasp_reward: float,
++    lift_reward: float,
++    discount: float,
++) -> np.ndarray:
++    """Shaping terms discount·Φ(s') − Φ(s) for consecutive transitions (e.g. an offline buffer).
++
++    Row i holds the state s_i and the command applied from it; s' is row i + 1 unless the
++    transition ends an episode (terminal: Φ(s') = 0). Matches `StagedRewardProcessorStep`.
++    """
++    shaping = np.zeros(len(joint_positions), dtype=np.float32)
++    closing, phi = False, 0.0
++    for i in range(len(joint_positions)):
++        closing = update_closing_intent(closing, float(gripper_commands[i]))
++        if dones[i] or i + 1 >= len(joint_positions):
++            shaping[i] = -phi
++            closing, phi = False, 0.0
++            continue
++        phi_next = grasp_progress(
++            joint_positions[i + 1],
++            closing,
++            kinematics,
++            grasp_min_gripper_pos,
++            lift_height,
++            grasp_reward,
++            lift_reward,
++            previous_gripper_pos=float(joint_positions[i][-1]),
++        )
++        shaping[i] = discount * phi_next - phi
++        phi = phi_next
++    return shaping
++
++
++@ProcessorStepRegistry.register("staged_reward_processor")
++@dataclass
++class StagedRewardProcessorStep(ProcessorStep):
++    """Adds potential-based grasp/lift shaping to the environment reward.
++
++    Φ comes from `grasp_progress` (raw joint positions after the step and the latched gripper
++    command of the executed action), and each step adds discount·Φ(s') − Φ(s), with Φ(s') = 0 on
++    terminal steps. The shaping cannot be farmed (dropping gives it back) and leaves the optimal
++    policy unchanged, while rewarding the grasp and the lift as soon as they happen.
++
++    Attributes:
++        kinematics: Robot kinematics used to get the end-effector height.
++        motor_names: Joint order of the raw joint positions (gripper last).
++        grasp_reward: Φ when grasped.
++        lift_reward: Φ when grasped and lifted.
++        grasp_min_gripper_pos: Gripper position above which a closed gripper holds something.
++        lift_height: End-effector height above which a grasped object is lifted.
++        discount: RL discount used in the shaping term.
++    """
++
++    kinematics: Any
++    motor_names: list[str]
++    grasp_reward: float = 0.1
++    lift_reward: float = 0.3
++    grasp_min_gripper_pos: float = 2.5
++    lift_height: float = 0.05
++    discount: float = 0.97
++
++    def __post_init__(self):
++        self._closing = False
++        self._phi = 0.0
++        self._previous_gripper_pos: float | None = None
++
++    def __call__(self, transition: EnvTransition) -> EnvTransition:
++        complementary_data = transition.get(TransitionKey.COMPLEMENTARY_DATA) or {}
++        raw_joints = complementary_data.get("raw_joint_positions")
++        executed_action = complementary_data.get(TELEOP_ACTION_KEY)
++        if raw_joints is None or not isinstance(executed_action, torch.Tensor):
++            return transition
++
++        self._closing = update_closing_intent(self._closing, float(executed_action.flatten()[-1]))
++        joints = np.array([raw_joints[f"{m}.pos"] for m in self.motor_names], dtype=float)
++        phi_next = grasp_progress(
++            joints,
++            self._closing,
++            self.kinematics,
++            self.grasp_min_gripper_pos,
++            self.lift_height,
++            self.grasp_reward,
++            self.lift_reward,
++            previous_gripper_pos=self._previous_gripper_pos,
++        )
++        self._previous_gripper_pos = float(joints[-1])
++        terminal = bool(transition.get(TransitionKey.DONE, False))
++        shaping = (0.0 if terminal else self.discount * phi_next) - self._phi
++        self._phi = phi_next
++
++        new_transition = transition.copy()
++        new_transition[TransitionKey.REWARD] = float(transition.get(TransitionKey.REWARD) or 0.0) + shaping
++        info = dict(new_transition.get(TransitionKey.INFO) or {})
++        info["staged_reward_potential"] = phi_next
++        new_transition[TransitionKey.INFO] = info
++        return new_transition
++
++    def reset(self) -> None:
++        self._closing = False
++        self._phi = 0.0
++        self._previous_gripper_pos = None
++
++    def get_config(self) -> dict[str, Any]:
++        return {
++            "motor_names": self.motor_names,
++            "grasp_reward": self.grasp_reward,
++            "lift_reward": self.lift_reward,
++            "grasp_min_gripper_pos": self.grasp_min_gripper_pos,
++            "lift_height": self.lift_height,
++            "discount": self.discount,
++        }
++
++    def transform_features(
++        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
++    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
++        return features
+diff --git a/src/lerobot/rl/actor.py b/src/lerobot/rl/actor.py
+index df703cc7..b3630af2 100644
+--- a/src/lerobot/rl/actor.py
++++ b/src/lerobot/rl/actor.py
+@@ -87,7 +87,7 @@ from lerobot.cameras import opencv  # noqa: F401
+ from lerobot.configs import parser
+ from lerobot.policies import make_policy, make_pre_post_processors
+ from lerobot.processor import TransitionKey
+-from lerobot.robots import so_follower  # noqa: F401
++from lerobot.robots import so101_sim, so_follower  # noqa: F401
+ from lerobot.teleoperators import gamepad, so_leader  # noqa: F401
+ from lerobot.teleoperators.utils import TeleopEvents
+ from lerobot.utils.device_utils import get_safe_torch_device
+@@ -98,6 +98,7 @@ from lerobot.utils.transition import (
+     Transition,
+     move_transition_to_device,
+ )
++from lerobot.utils.visualization_utils import init_visualization, shutdown_visualization
+ from lerobot.utils.utils import (
+     TimerManager,
+     init_logging,
+@@ -106,6 +107,7 @@ from lerobot.utils.utils import (
+ from .algorithms.base import RLAlgorithm
+ from .algorithms.factory import make_algorithm
+ from .gym_manipulator import (
++    log_transition_visualization,
+     make_processors,
+     make_robot_env,
+     reset_and_build_transition,
+@@ -114,6 +116,9 @@ from .gym_manipulator import (
+ from .queue import get_last_item_from_queue
+ from .train_rl import TrainRLServerPipelineConfig
+ 
++# Discrete gripper command that closes the SO101 gripper (GripperVelocityToJoint lowers the position)
++CLOSE_GRIPPER_COMMAND = 2.0
++
+ # Main entry point
+ 
+ 
+@@ -121,6 +126,7 @@ from .train_rl import TrainRLServerPipelineConfig
+ def actor_cli(cfg: TrainRLServerPipelineConfig):
+     # Fail fast with a friendly error if the optional ``hilserl`` extra is missing.
+     require_package("grpcio", extra="hilserl", import_name="grpc")
++    cfg.set_run_dir("actor")
+     cfg.validate()
+     display_pid = False
+     if not use_threads(cfg):
+@@ -205,21 +211,30 @@ def actor_cli(cfg: TrainRLServerPipelineConfig):
+         logging.exception("[ACTOR] Unhandled exception in act_with_policy")
+         shutdown_event.set()
+     finally:
+-        logging.info("[ACTOR] Closing queues")
+-        transitions_queue.close()
+-        interactions_queue.close()
+-        parameters_queue.close()
++        # Also covers a normal loop exit, so the worker loops stop on their own
++        shutdown_event.set()
+ 
+-        transitions_process.join()
++        # Let the senders notice the shutdown (they poll their queue with a timeout) before closing it
++        transitions_process.join(timeout=5)
+         logging.info("[ACTOR] Transitions process joined")
+-        interactions_process.join()
++        interactions_process.join(timeout=5)
+         logging.info("[ACTOR] Interactions process joined")
+-        receive_policy_process.join()
+-        logging.info("[ACTOR] Receive policy process joined")
+ 
+-        transitions_queue.cancel_join_thread()
+-        interactions_queue.cancel_join_thread()
+-        parameters_queue.cancel_join_thread()
++        logging.info("[ACTOR] Closing queues")
++        # Don't block interpreter exit flushing data that nobody will read anymore
++        for queue in (transitions_queue, interactions_queue, parameters_queue):
++            queue.cancel_join_thread()
++            queue.close()
++
++        # The policy receiver blocks on the gRPC stream until the next message arrives;
++        # closing the channel cancels the stream and wakes it up
++        if grpc_channel is not None:
++            grpc_channel.close()
++        receive_policy_process.join(timeout=5)
++        if receive_policy_process.is_alive():
++            logging.warning("[ACTOR] Receive policy process did not stop in time, exiting anyway")
++        else:
++            logging.info("[ACTOR] Receive policy process joined")
+ 
+         logging.info("[ACTOR] Cleanup complete")
+ 
+@@ -260,171 +275,194 @@ def act_with_policy(
+     online_env, teleop_device = make_robot_env(cfg=cfg.env)
+     env_processor, action_processor = make_processors(online_env, teleop_device, cfg.env, cfg.policy.device)
+ 
+-    set_seed(cfg.seed)
+-    device = get_safe_torch_device(cfg.policy.device, log=True)
+-
+-    torch.backends.cudnn.benchmark = True
+-    torch.backends.cuda.matmul.allow_tf32 = True
+-
+-    logging.info("make_policy")
+-
+-    ### Instantiate the policy in both the actor and learner processes
+-    ### To avoid sending a policy object through the port, we create a policy instance
+-    ### on both sides, the learner sends the updated parameters every n steps to update the actor's parameters
+-    policy = make_policy(
+-        cfg=cfg.policy,
+-        env_cfg=cfg.env,
+-    )
+-    policy = policy.to(device).eval()
+-    assert isinstance(policy, nn.Module)
++    if cfg.display_mode is not None:
++        init_visualization(cfg.display_mode, session_name="hilserl_actor")
+ 
+-    # Build the algorithm
+-    algorithm = make_algorithm(cfg=cfg.algorithm, policy=policy)
+-
+-    preprocessor, postprocessor = make_pre_post_processors(
+-        policy_cfg=cfg.policy,
+-        dataset_stats=cfg.policy.dataset_stats,
+-    )
+-
+-    transition = reset_and_build_transition(online_env, env_processor, action_processor)
+-
+-    # NOTE: For the moment we will solely handle the case of a single environment
+-    sum_reward_episode = 0
+-    list_transition_to_send_to_learner = []
+-    episode_intervention = False
+-    # Add counters for intervention rate calculation
+-    episode_intervention_steps = 0
+-    episode_total_steps = 0
++    try:
++        set_seed(cfg.seed)
++        device = get_safe_torch_device(cfg.policy.device, log=True)
+ 
+-    policy_timer = TimerManager("Policy inference", log=False)
++        torch.backends.cudnn.benchmark = True
++        torch.backends.cuda.matmul.allow_tf32 = True
+ 
+-    for interaction_step in range(cfg.policy.online_steps):
+-        start_time = time.perf_counter()
+-        if shutdown_event.is_set():
+-            logging.info("[ACTOR] Shutting down act_with_policy")
+-            return
++        logging.info("make_policy")
+ 
+-        observation = {
+-            k: v for k, v in transition[TransitionKey.OBSERVATION].items() if k in cfg.policy.input_features
+-        }
+-
+-        # Time policy inference and check if it meets FPS requirement
+-        with policy_timer:
+-            normalized_observation = preprocessor.process_observation(observation)
+-            action = policy.select_action(batch=normalized_observation)
+-            # Unnormalize only the continuous part.
+-            if cfg.policy.num_discrete_actions is not None:
+-                continuous_action = postprocessor.process_action(action[..., :-1])
+-                discrete_action = action[..., -1:].to(
+-                    device=continuous_action.device, dtype=continuous_action.dtype
+-                )
+-                action = torch.cat([continuous_action, discrete_action], dim=-1)
+-            else:
+-                action = postprocessor.process_action(action)
+-        policy_fps = policy_timer.fps_last
+-
+-        log_policy_frequency_issue(policy_fps=policy_fps, cfg=cfg, interaction_step=interaction_step)
+-
+-        # Use the new step function
+-        new_transition = step_env_and_process_transition(
+-            env=online_env,
+-            transition=transition,
+-            action=action,
+-            env_processor=env_processor,
+-            action_processor=action_processor,
++        ### Instantiate the policy in both the actor and learner processes
++        ### To avoid sending a policy object through the port, we create a policy instance
++        ### on both sides, the learner sends the updated parameters every n steps to update the actor's parameters
++        policy = make_policy(
++            cfg=cfg.policy,
++            env_cfg=cfg.env,
+         )
++        policy = policy.to(device).eval()
++        assert isinstance(policy, nn.Module)
+ 
+-        # Extract values from processed transition
+-        next_observation = {
+-            k: v
+-            for k, v in new_transition[TransitionKey.OBSERVATION].items()
+-            if k in cfg.policy.input_features
+-        }
++        # Build the algorithm
++        algorithm = make_algorithm(cfg=cfg.algorithm, policy=policy)
+ 
+-        # Teleop action is the action that was executed in the environment
+-        # It is either the action from the teleop device or the action from the policy
+-        executed_action = new_transition[TransitionKey.COMPLEMENTARY_DATA]["teleop_action"]
+-
+-        reward = new_transition[TransitionKey.REWARD]
+-        done = new_transition.get(TransitionKey.DONE, False)
+-        truncated = new_transition.get(TransitionKey.TRUNCATED, False)
+-
+-        sum_reward_episode += float(reward)
+-        episode_total_steps += 1
+-
+-        # Check for intervention from transition info
+-        intervention_info = new_transition[TransitionKey.INFO]
+-        is_intervention = bool(intervention_info.get(TeleopEvents.IS_INTERVENTION, False))
+-        if is_intervention:
+-            episode_intervention = True
+-            episode_intervention_steps += 1
+-
+-        complementary_info = {
+-            "discrete_penalty": torch.tensor(
+-                [new_transition[TransitionKey.COMPLEMENTARY_DATA].get("discrete_penalty", 0.0)]
+-            ),
+-            TeleopEvents.IS_INTERVENTION.value: is_intervention,
+-        }
+-        # Create transition for learner (convert to old format)
+-        list_transition_to_send_to_learner.append(
+-            Transition(
+-                state=observation,
+-                action=executed_action,
+-                reward=reward,
+-                next_state=next_observation,
+-                done=done,
+-                truncated=truncated,
+-                complementary_info=complementary_info,
+-            )
++        preprocessor, postprocessor = make_pre_post_processors(
++            policy_cfg=cfg.policy,
++            dataset_stats=cfg.policy.dataset_stats,
+         )
+ 
+-        # Update transition for next iteration
+-        transition = new_transition
+-
+-        if done or truncated:
+-            logging.info(f"[ACTOR] Global step {interaction_step}: Episode reward: {sum_reward_episode}")
+-
+-            update_policy_parameters(algorithm=algorithm, parameters_queue=parameters_queue, device=device)
++        transition = reset_and_build_transition(online_env, env_processor, action_processor)
++
++        # NOTE: For the moment we will solely handle the case of a single environment
++        sum_reward_episode = 0
++        list_transition_to_send_to_learner = []
++        episode_intervention = False
++        # Add counters for intervention rate calculation
++        episode_intervention_steps = 0
++        episode_total_steps = 0
++
++        policy_timer = TimerManager("Policy inference", log=False)
++
++        for interaction_step in range(cfg.policy.online_steps):
++            start_time = time.perf_counter()
++            if shutdown_event.is_set():
++                logging.info("[ACTOR] Shutting down act_with_policy")
++                return
++
++            observation = {
++                k: v for k, v in transition[TransitionKey.OBSERVATION].items() if k in cfg.policy.input_features
++            }
++
++            # Time policy inference and check if it meets FPS requirement
++            with policy_timer:
++                normalized_observation = preprocessor.process_observation(observation)
++                action = policy.select_action(batch=normalized_observation)
++                # Unnormalize only the continuous part.
++                if cfg.policy.num_discrete_actions is not None:
++                    continuous_action = postprocessor.process_action(action[..., :-1])
++                    discrete_action = action[..., -1:].to(
++                        device=continuous_action.device, dtype=continuous_action.dtype
++                    )
++                    # Gripper exploration: the discrete action is otherwise always the critic's argmax.
++                    # Only try closing an open gripper; random opening would drop a held object.
++                    if torch.rand(()).item() < cfg.discrete_action_epsilon:
++                        raw_joints = online_env.get_raw_joint_positions() or {}
++                        max_gripper = cfg.env.processor.max_gripper_pos or 100.0
++                        if raw_joints.get("gripper.pos", 0.0) > max_gripper / 2:
++                            discrete_action = torch.full_like(discrete_action, CLOSE_GRIPPER_COMMAND)
++                    action = torch.cat([continuous_action, discrete_action], dim=-1)
++                else:
++                    action = postprocessor.process_action(action)
++            policy_fps = policy_timer.fps_last
++
++            log_policy_frequency_issue(policy_fps=policy_fps, cfg=cfg, interaction_step=interaction_step)
++
++            # Use the new step function
++            new_transition = step_env_and_process_transition(
++                env=online_env,
++                transition=transition,
++                action=action,
++                env_processor=env_processor,
++                action_processor=action_processor,
++            )
+ 
+-            if len(list_transition_to_send_to_learner) > 0:
+-                push_transitions_to_transport_queue(
+-                    transitions=list_transition_to_send_to_learner,
+-                    transitions_queue=transitions_queue,
+-                )
+-                list_transition_to_send_to_learner = []
+-
+-            stats = get_frequency_stats(policy_timer)
+-            policy_timer.reset()
+-
+-            # Calculate intervention rate
+-            intervention_rate = 0.0
+-            if episode_total_steps > 0:
+-                intervention_rate = episode_intervention_steps / episode_total_steps
+-
+-            # Send episodic reward to the learner
+-            interactions_queue.put(
+-                python_object_to_bytes(
+-                    {
+-                        "Episodic reward": sum_reward_episode,
+-                        "Interaction step": interaction_step,
+-                        "Episode intervention": int(episode_intervention),
+-                        "Intervention rate": intervention_rate,
+-                        **stats,
+-                    }
++            if cfg.display_mode is not None:
++                raw_images = online_env.get_raw_images() if hasattr(online_env, "get_raw_images") else None
++                log_transition_visualization(new_transition, cfg, raw_images)
++
++            # Extract values from processed transition
++            next_observation = {
++                k: v
++                for k, v in new_transition[TransitionKey.OBSERVATION].items()
++                if k in cfg.policy.input_features
++            }
++
++            # Teleop action is the action that was executed in the environment
++            # It is either the action from the teleop device or the action from the policy
++            executed_action = new_transition[TransitionKey.COMPLEMENTARY_DATA]["teleop_action"]
++
++            reward = new_transition[TransitionKey.REWARD]
++            done = new_transition.get(TransitionKey.DONE, False)
++            truncated = new_transition.get(TransitionKey.TRUNCATED, False)
++
++            sum_reward_episode += float(reward)
++            episode_total_steps += 1
++
++            # Check for intervention from transition info
++            intervention_info = new_transition[TransitionKey.INFO]
++            is_intervention = bool(intervention_info.get(TeleopEvents.IS_INTERVENTION, False))
++            if is_intervention:
++                episode_intervention = True
++                episode_intervention_steps += 1
++
++            complementary_info = {
++                "discrete_penalty": torch.tensor(
++                    [new_transition[TransitionKey.COMPLEMENTARY_DATA].get("discrete_penalty", 0.0)]
++                ),
++                TeleopEvents.IS_INTERVENTION.value: is_intervention,
++            }
++            # Create transition for learner (convert to old format)
++            list_transition_to_send_to_learner.append(
++                Transition(
++                    state=observation,
++                    action=executed_action,
++                    reward=reward,
++                    next_state=next_observation,
++                    done=done,
++                    truncated=truncated,
++                    complementary_info=complementary_info,
+                 )
+             )
+ 
+-            # Reset intervention counters and environment
+-            sum_reward_episode = 0.0
+-            episode_intervention = False
+-            episode_intervention_steps = 0
+-            episode_total_steps = 0
++            # Update transition for next iteration
++            transition = new_transition
++
++            if done or truncated:
++                logging.info(f"[ACTOR] Global step {interaction_step}: Episode reward: {sum_reward_episode}")
++
++                update_policy_parameters(algorithm=algorithm, parameters_queue=parameters_queue, device=device)
++
++                if len(list_transition_to_send_to_learner) > 0:
++                    push_transitions_to_transport_queue(
++                        transitions=list_transition_to_send_to_learner,
++                        transitions_queue=transitions_queue,
++                    )
++                    list_transition_to_send_to_learner = []
++
++                stats = get_frequency_stats(policy_timer)
++                policy_timer.reset()
++
++                # Calculate intervention rate
++                intervention_rate = 0.0
++                if episode_total_steps > 0:
++                    intervention_rate = episode_intervention_steps / episode_total_steps
++
++                # Send episodic reward to the learner
++                interactions_queue.put(
++                    python_object_to_bytes(
++                        {
++                            "Episodic reward": sum_reward_episode,
++                            "Interaction step": interaction_step,
++                            "Episode intervention": int(episode_intervention),
++                            "Intervention rate": intervention_rate,
++                            **stats,
++                        }
++                    )
++                )
+ 
+-            transition = reset_and_build_transition(online_env, env_processor, action_processor)
++                # Reset intervention counters and environment
++                sum_reward_episode = 0.0
++                episode_intervention = False
++                episode_intervention_steps = 0
++                episode_total_steps = 0
+ 
+-        if cfg.env.fps is not None:
+-            dt_time = time.perf_counter() - start_time
+-            precise_sleep(max(1 / cfg.env.fps - dt_time, 0.0))
++                transition = reset_and_build_transition(online_env, env_processor, action_processor)
++
++            if cfg.env.fps is not None:
++                dt_time = time.perf_counter() - start_time
++                precise_sleep(max(1 / cfg.env.fps - dt_time, 0.0))
++    finally:
++        # Release the simulator (GL contexts, viewer), the robot and the teleop in order;
++        # leaving them to interpreter teardown can crash the process on exit
++        if cfg.display_mode is not None:
++            shutdown_visualization(cfg.display_mode)
++        online_env.close()
++        if teleop_device is not None and teleop_device.is_connected:
++            teleop_device.disconnect()
+ 
+ 
+ #  Communication Functions - Group all gRPC/messaging functions
+@@ -530,7 +568,11 @@ def receive_policy(
+         )
+ 
+     except grpc.RpcError as e:
+-        logging.error(f"[ACTOR] gRPC error: {e}")
++        if shutdown_event.is_set():
++            # Expected: the channel is closed on shutdown to unblock this stream
++            logging.info("[ACTOR] Parameters stream closed")
++        else:
++            logging.error(f"[ACTOR] gRPC error: {e}")
+ 
+     if not use_threads(cfg):
+         grpc_channel.close()
+diff --git a/src/lerobot/rl/buffer.py b/src/lerobot/rl/buffer.py
+index 01586819..df442290 100644
+--- a/src/lerobot/rl/buffer.py
++++ b/src/lerobot/rl/buffer.py
+@@ -661,7 +661,7 @@ class ReplayBuffer:
+             # ----- 1) Current state -----
+             current_state: dict[str, torch.Tensor] = {}
+             for key in state_keys:
+-                val = current_sample[key]
++                val = _to_float_image(key, current_sample[key])
+                 current_state[key] = val.unsqueeze(0)  # Add batch dimension
+ 
+             # ----- 2) Action -----
+@@ -696,7 +696,7 @@ class ReplayBuffer:
+                     # Build next_state from the same keys
+                     next_state_data: dict[str, torch.Tensor] = {}
+                     for key in state_keys:
+-                        val = next_sample[key]
++                        val = _to_float_image(key, next_sample[key])
+                         next_state_data[key] = val.unsqueeze(0)  # Add batch dimension
+                     next_state = next_state_data
+ 
+@@ -754,6 +754,17 @@ def guess_feature_info(t, name: str):
+         }
+ 
+ 
++def _to_float_image(key: str, value: torch.Tensor) -> torch.Tensor:
++    """Convert uint8 camera frames to float in [0, 1].
++
++    Datasets built for training decode frames as uint8 (``return_uint8=True``), while the online
++    environment sends float images in [0, 1]. Both must share one scale in the replay buffers.
++    """
++    if key.startswith(OBS_IMAGE) and value.dtype == torch.uint8:
++        return value.float() / 255.0
++    return value
++
++
+ def concatenate_batch_transitions(
+     left_batch_transitions: BatchTransition, right_batch_transition: BatchTransition
+ ) -> BatchTransition:
+diff --git a/src/lerobot/rl/crop_dataset_roi.py b/src/lerobot/rl/crop_dataset_roi.py
+index eece13a4..ea65690b 100644
+--- a/src/lerobot/rl/crop_dataset_roi.py
++++ b/src/lerobot/rl/crop_dataset_roi.py
+@@ -28,10 +28,13 @@ from lerobot.datasets import LeRobotDataset
+ from lerobot.utils.constants import DONE, REWARD
+ 
+ 
+-def select_rect_roi(img):
++def select_rect_roi(img, display_size: int = 960):
+     """
+     Allows the user to draw a rectangular ROI on the image.
+ 
++    The image is shown scaled so its longer side is ``display_size`` pixels; the returned ROI is
++    always expressed in the original image's pixel coordinates.
++
+     The user must click and drag to draw the rectangle.
+     - While dragging, the rectangle is dynamically drawn.
+     - On mouse button release, the rectangle is fixed.
+@@ -43,8 +46,12 @@ def select_rect_roi(img):
+         A tuple (top, left, height, width) representing the rectangular ROI,
+         or None if no valid ROI is selected.
+     """
+-    # Create a working copy of the image
+-    clone = img.copy()
++    scale = display_size / max(img.shape[:2])
++    display_hw = (round(img.shape[1] * scale), round(img.shape[0] * scale))
++    interpolation = cv2.INTER_NEAREST if scale > 1 else cv2.INTER_AREA
++
++    # Create a working copy of the (scaled) image
++    clone = cv2.resize(img, display_hw, interpolation=interpolation)
+     working_img = clone.copy()
+ 
+     roi = None  # Will store the final ROI as (top, left, height, width)
+@@ -54,6 +61,10 @@ def select_rect_roi(img):
+     def mouse_callback(event, x, y, flags, param):
+         nonlocal index_x, index_y, drawing, roi, working_img
+ 
++        # Dragging past the window edge reports coordinates outside the image
++        x = min(max(x, 0), clone.shape[1])
++        y = min(max(y, 0), clone.shape[0])
++
+         if event == cv2.EVENT_LBUTTONDOWN:
+             # Start drawing: record starting coordinates
+             drawing = True
+@@ -78,16 +89,15 @@ def select_rect_roi(img):
+             left = min(index_x, x)
+             bottom = max(index_y, y)
+             right = max(index_x, x)
+-            height = bottom - top
+-            width = right - left
+-            roi = (top, left, height, width)  # (top, left, height, width)
++            # Map the display-space rectangle back to original image pixels
++            roi = tuple(round(v / scale) for v in (top, left, bottom - top, right - left))
+             # Draw the final rectangle on the working image and display it
+             working_img = clone.copy()
+             cv2.rectangle(working_img, (left, top), (right, bottom), (0, 255, 0), 2)
+             cv2.imshow("Select ROI", working_img)
+ 
+     # Create the window and set the callback
+-    cv2.namedWindow("Select ROI")
++    cv2.namedWindow("Select ROI", cv2.WINDOW_AUTOSIZE)
+     cv2.setMouseCallback("Select ROI", mouse_callback)
+     cv2.imshow("Select ROI", working_img)
+ 
+@@ -117,7 +127,7 @@ def select_rect_roi(img):
+     return roi
+ 
+ 
+-def select_square_roi_for_images(images: dict) -> dict:
++def select_square_roi_for_images(images: dict, display_size: int = 960) -> dict:
+     """
+     For each image in the provided dictionary, open a window to allow the user
+     to select a rectangular ROI. Returns a dictionary mapping each key to a tuple
+@@ -125,6 +135,7 @@ def select_square_roi_for_images(images: dict) -> dict:
+ 
+     Parameters:
+         images (dict): Dictionary where keys are identifiers and values are OpenCV images.
++        display_size (int): Length in pixels of the longer side of the selection window.
+ 
+     Returns:
+         dict: Mapping of image keys to the selected rectangular ROI.
+@@ -137,7 +148,7 @@ def select_square_roi_for_images(images: dict) -> dict:
+             continue
+ 
+         print(f"\nSelect rectangular ROI for image with key: '{key}'")
+-        roi = select_rect_roi(img)
++        roi = select_rect_roi(img, display_size=display_size)
+ 
+         if roi is None:
+             print(f"No valid ROI selected for '{key}'.")
+@@ -208,6 +219,11 @@ def convert_lerobot_dataset_to_cropped_lerobot_dataset(
+     for frame_idx in tqdm(range(len(original_dataset))):
+         frame = original_dataset[frame_idx]
+ 
++        # Close the previous episode before adding the first frame of the next one
++        if frame["episode_index"].item() != prev_episode_index:
++            new_dataset.save_episode()
++            prev_episode_index = frame["episode_index"].item()
++
+         # Create a copy of the frame to add to the new dataset
+         new_frame = {}
+         for key, value in frame.items():
+@@ -230,13 +246,10 @@ def convert_lerobot_dataset_to_cropped_lerobot_dataset(
+         new_frame["task"] = task
+         new_dataset.add_frame(new_frame)
+ 
+-        if frame["episode_index"].item() != prev_episode_index:
+-            # Save the episode
+-            new_dataset.save_episode()
+-            prev_episode_index = frame["episode_index"].item()
+-
+     # Save the last episode
+     new_dataset.save_episode()
++    # Flush buffered episode metadata, otherwise the last partial batch of episodes is lost
++    new_dataset.finalize()
+ 
+     if push_to_hub:
+         new_dataset.push_to_hub()
+@@ -281,6 +294,12 @@ if __name__ == "__main__":
+         default=None,
+         help="The repository id for the new cropped and resized dataset. If not provided, it defaults to `repo_id` + '_cropped_resized'.",
+     )
++    parser.add_argument(
++        "--display-size",
++        type=int,
++        default=960,
++        help="Length in pixels of the longer side of the ROI selection window.",
++    )
+     args = parser.parse_args()
+ 
+     dataset = LeRobotDataset(repo_id=args.repo_id, root=args.root)
+@@ -290,7 +309,7 @@ if __name__ == "__main__":
+     images = {k: (v * 255).astype("uint8") for k, v in images.items()}
+ 
+     if args.crop_params_path is None:
+-        rois = select_square_roi_for_images(images)
++        rois = select_square_roi_for_images(images, display_size=args.display_size)
+     else:
+         with open(args.crop_params_path) as f:
+             rois = json.load(f)
+@@ -324,3 +343,7 @@ if __name__ == "__main__":
+ 
+     with open(meta_dir / "crop_params.json", "w") as f:
+         json.dump(rois, f, indent=4)
++
++    # Repeat the ROIs last: video encoding logs usually push the earlier print out of view
++    print(f"\nCrop params saved to {meta_dir / 'crop_params.json'}:")
++    print(json.dumps(rois, indent=4))
+diff --git a/src/lerobot/rl/eval_policy.py b/src/lerobot/rl/eval_policy.py
+index 0f42d757..3eca12c4 100644
+--- a/src/lerobot/rl/eval_policy.py
++++ b/src/lerobot/rl/eval_policy.py
+@@ -13,62 +13,274 @@
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
++"""Evaluate a HIL-SERL checkpoint on the real robot or in simulation.
++
++Runs the policy with the exact environment and processing pipeline used by the actor during
++training (cropping, IK, bounds, reward classifier, ...), without a learner and without updating
++the weights. Success is decided by the reward classifier / simulator (or the success key). Pressing
++Space still lets you take over for safety; such episodes are reported separately.
++
++Each episode is also classified by the furthest stage it reached: not grasped, grasped, lifted
++(from the staged reward potential, when configured) or success. In simulation the true cube
++height is checked too, so a "lifted" that did not really lift the cube shows up as "fake lift".
++
++Examples:
++
++```shell
++# watch it (real robot, or sim with the MuJoCo window)
++python -m lerobot.rl.eval_policy \
++    --policy_path=outputs/train/<run>/checkpoints/last/pretrained_model --n_episodes=10
++
++# fast statistics in simulation: no window, no leader arm, no real-time pacing
++python -m lerobot.rl.eval_policy \
++    --policy_path=outputs/train/<run>/checkpoints/0010000/pretrained_model --n_episodes=50 --headless=true
++```
++"""
++
+ import logging
++import time
++from collections import Counter
++from dataclasses import dataclass
++from pathlib import Path
++
++import draccus
++import torch
+ 
+ from lerobot.cameras import opencv  # noqa: F401
+-from lerobot.configs import parser
+-from lerobot.datasets import LeRobotDataset
+-from lerobot.policies import make_policy
+-from lerobot.robots import (  # noqa: F401
+-    RobotConfig,
+-    make_robot_from_config,
+-    so_follower,
+-)
+-from lerobot.teleoperators import (
+-    gamepad,  # noqa: F401
+-    so_leader,  # noqa: F401
+-)
++from lerobot.policies import make_policy, make_pre_post_processors
++from lerobot.processor import TransitionKey
++from lerobot.robots import make_robot_from_config, so101_sim, so_follower  # noqa: F401
++from lerobot.teleoperators import gamepad, so_leader  # noqa: F401
++from lerobot.teleoperators.utils import TeleopEvents
++from lerobot.utils.robot_utils import precise_sleep
++from lerobot.utils.utils import init_logging
+ 
+-from .gym_manipulator import make_robot_env
++from .gym_manipulator import (
++    RobotEnv,
++    make_processors,
++    make_robot_env,
++    reset_and_build_transition,
++    step_env_and_process_transition,
++)
+ from .train_rl import TrainRLServerPipelineConfig
+ 
+-logging.basicConfig(level=logging.INFO)
+ 
++@dataclass
++class EvalRLConfig:
++    # Checkpoint's pretrained_model directory (contains config.json, model.safetensors, train_config.json)
++    policy_path: str
++    n_episodes: int = 10
++    # Use the mean action instead of sampling: evaluates the learned behaviour without exploration noise
++    deterministic: bool = True
++    # Simulation only: no viewer, no teleop device and no real-time pacing (fast statistics)
++    headless: bool = False
++    # Seed of the simulated scene (cube positions), so checkpoints can be compared on the same episodes
++    seed: int | None = 0
++    # A cube center higher than this (m) counts as really lifted (simulation only)
++    lift_check_height: float = 0.03
++
++
++# Furthest stage first
++STAGES = ["SUCCESS", "lifted", "fake lift", "grasped", "not grasped"]
++
++
++class _NoTeleop:
++    """Teleop stand-in for headless evaluation: never intervenes (any action type is ignored)."""
++
++    is_connected = True
++
++    def __init__(self, motor_names: list[str]):
++        self._motor_names = motor_names
+ 
+-def eval_policy(env, policy, n_episodes):
+-    sum_reward_episode = []
+-    for _ in range(n_episodes):
+-        obs, _ = env.reset()
+-        episode_reward = 0.0
++    def get_action(self) -> dict[str, float]:
++        return {f"{m}.pos": 0.0 for m in self._motor_names}
++
++    def get_teleop_events(self) -> dict:
++        return {
++            TeleopEvents.IS_INTERVENTION: False,
++            TeleopEvents.TERMINATE_EPISODE: False,
++            TeleopEvents.SUCCESS: False,
++            TeleopEvents.RERECORD_EPISODE: False,
++        }
++
++    def send_feedback(self, *args, **kwargs) -> None:
++        pass
++
++    def enable_torque(self) -> None:
++        pass
++
++    def disable_torque(self) -> None:
++        pass
++
++    def disconnect(self) -> None:
++        pass
++
++
++@torch.no_grad()
++def select_eval_action(policy, batch: dict[str, torch.Tensor], deterministic: bool) -> torch.Tensor:
++    """Same as ``GaussianActorPolicy.select_action``, optionally using the distribution mean."""
++    if not deterministic:
++        return policy.select_action(batch)
++
++    features = None
++    if policy.shared_encoder and policy.actor.encoder.has_images:
++        features = policy.actor.encoder.get_cached_image_features(batch)
++    _, _, means = policy.actor(batch, features)
++    actions = torch.tanh(means) * policy.actor.action_scale
++
++    if policy.config.num_discrete_actions is not None:
++        if policy.discrete_critic is not None:
++            q_values = policy.discrete_critic(batch, features)
++            discrete = torch.argmax(q_values, dim=-1, keepdim=True).to(actions.dtype)
++        else:
++            discrete = torch.ones((*actions.shape[:-1], 1), device=actions.device, dtype=actions.dtype)
++        actions = torch.cat([actions, discrete], dim=-1)
++    return actions
++
++
++def run_episodes(env, env_processor, action_processor, policy, preprocessor, postprocessor, cfg, eval_cfg):
++    results = []
++    transition = reset_and_build_transition(env, env_processor, action_processor)
++    robot = getattr(env, "robot", None)
++    while len(results) < eval_cfg.n_episodes:
++        episode_reward, steps, intervention_steps = 0.0, 0, 0
++        max_potential, max_object_height = 0.0, None
++        start_episode = time.perf_counter()
+         while True:
+-            action = policy.select_action(obs)
+-            obs, reward, terminated, truncated, _ = env.step(action)
+-            episode_reward += reward
+-            if terminated or truncated:
++            start_step = time.perf_counter()
++            observation = {
++                k: v
++                for k, v in transition[TransitionKey.OBSERVATION].items()
++                if k in cfg.policy.input_features
++            }
++            action = select_eval_action(policy, preprocessor.process_observation(observation), eval_cfg.deterministic)
++            if cfg.policy.num_discrete_actions is not None:
++                continuous = postprocessor.process_action(action[..., :-1])
++                action = torch.cat([continuous, action[..., -1:].to(continuous)], dim=-1)
++            else:
++                action = postprocessor.process_action(action)
++
++            transition = step_env_and_process_transition(
++                env=env,
++                transition=transition,
++                action=action,
++                env_processor=env_processor,
++                action_processor=action_processor,
++            )
++            episode_reward += float(transition[TransitionKey.REWARD])
++            steps += 1
++            info = transition[TransitionKey.INFO]
++            if info.get(TeleopEvents.IS_INTERVENTION, False):
++                intervention_steps += 1
++            max_potential = max(max_potential, float(info.get("staged_reward_potential", 0.0)))
++            if hasattr(robot, "object_height"):
++                height = robot.object_height()
++                max_object_height = height if max_object_height is None else max(max_object_height, height)
++
++            terminated = transition.get(TransitionKey.DONE, False)
++            if terminated or transition.get(TransitionKey.TRUNCATED, False):
+                 break
+-        sum_reward_episode.append(episode_reward)
++            if not eval_cfg.headless:
++                precise_sleep(max(1 / cfg.env.fps - (time.perf_counter() - start_step), 0.0))
++
++        # Success = the episode ended on the task reward (shaping alone never terminates an episode)
++        success = bool(terminated) and float(transition[TransitionKey.REWARD]) > 0.5
++        staged = cfg.env.processor.staged_reward
++        if success:
++            stage = "SUCCESS"
++        elif staged is not None and max_potential >= staged.lift_reward:
++            really_lifted = max_object_height is None or max_object_height > eval_cfg.lift_check_height
++            stage = "lifted" if really_lifted else "fake lift"
++        elif staged is not None and max_potential >= staged.grasp_reward:
++            stage = "grasped"
++        else:
++            stage = "not grasped"
++
++        result = {
++            "success": success,
++            "stage": stage,
++            "steps": steps,
++            "seconds": time.perf_counter() - start_episode,
++            "intervened": intervention_steps > 0,
++        }
++        results.append(result)
++        height_note = f", max cube height {max_object_height:.3f} m" if max_object_height is not None else ""
++        logging.info(
++            f"Episode {len(results)}/{eval_cfg.n_episodes}: {stage} in {steps} steps ({result['seconds']:.1f}s)"
++            + height_note
++            + (f", intervened for {intervention_steps} steps" if result["intervened"] else "")
++        )
++        transition = reset_and_build_transition(env, env_processor, action_processor)
++    return results
+ 
+-    logging.info(f"Success after 20 steps {sum_reward_episode}")
+-    logging.info(f"success rate {sum(sum_reward_episode) / len(sum_reward_episode)}")
+ 
++def report(results: list[dict]) -> None:
++    autonomous = [r for r in results if not r["intervened"]]
++    successes = [r for r in autonomous if r["success"]]
++    logging.info("=" * 50)
++    logging.info(f"Episodes: {len(results)} | with intervention (excluded): {len(results) - len(autonomous)}")
++    if autonomous:
++        logging.info(
++            f"Autonomous success rate: {len(successes)}/{len(autonomous)} "
++            f"= {100 * len(successes) / len(autonomous):.0f}%"
++        )
++    if successes:
++        mean_steps = sum(r["steps"] for r in successes) / len(successes)
++        logging.info(f"Mean steps of successful episodes: {mean_steps:.1f}")
++    if autonomous:
++        counts = Counter(r["stage"] for r in autonomous)
++        logging.info("Furthest stage reached (autonomous episodes):")
++        for stage in STAGES:
++            if counts.get(stage):
++                logging.info(f"  {stage:12s} {counts[stage]:3d}  ({100 * counts[stage] / len(autonomous):.0f}%)")
++        if counts.get("fake lift"):
++            logging.info("  'fake lift': the staged reward saw a lift but the cube stayed on the table")
++    logging.info("=" * 50)
+ 
+-@parser.wrap()
+-def main(cfg: TrainRLServerPipelineConfig):
+-    env_cfg = cfg.env
+-    env = make_robot_env(env_cfg)
+-    dataset_cfg = cfg.dataset
+-    dataset = LeRobotDataset(repo_id=dataset_cfg.repo_id)
+-    dataset_meta = dataset.meta
+ 
+-    policy = make_policy(
+-        cfg=cfg.policy,
+-        # env_cfg=cfg.env,
+-        ds_meta=dataset_meta,
+-    )
+-    policy = policy.from_pretrained(env_cfg.pretrained_policy_name_or_path)
+-    policy.eval()
++@draccus.wrap()
++def main(eval_cfg: EvalRLConfig):
++    init_logging()
++    policy_dir = Path(eval_cfg.policy_path)
++    cfg = TrainRLServerPipelineConfig.from_pretrained(str(policy_dir / "train_config.json"))
++    cfg.policy.pretrained_path = policy_dir
++    if hasattr(cfg.env.robot, "seed"):
++        cfg.env.robot.seed = eval_cfg.seed
+ 
+-    eval_policy(env, policy=policy, n_episodes=10)
++    if eval_cfg.headless:
++        if not hasattr(cfg.env.robot, "show_viewer"):
++            raise ValueError("headless evaluation is only available for simulated robots")
++        cfg.env.robot.show_viewer = False
++        robot = make_robot_from_config(cfg.env.robot)
++        reset = cfg.env.processor.reset
++        env = RobotEnv(
++            robot=robot,
++            use_gripper=cfg.env.processor.gripper.use_gripper if cfg.env.processor.gripper else True,
++            reset_pose=reset.fixed_reset_joint_positions if reset else None,
++            reset_time_s=0.0,
++            terminate_on_success=reset.terminate_on_success if reset else True,
++        )
++        teleop_device = _NoTeleop(list(robot.bus.motors))
++    else:
++        env, teleop_device = make_robot_env(cfg=cfg.env)
++    env_processor, action_processor = make_processors(env, teleop_device, cfg.env, cfg.policy.device)
++    try:
++        policy = make_policy(cfg=cfg.policy, env_cfg=cfg.env).eval()
++        preprocessor, postprocessor = make_pre_post_processors(
++            policy_cfg=cfg.policy, dataset_stats=cfg.policy.dataset_stats
++        )
++        logging.info(
++            f"Evaluating {policy_dir} for {eval_cfg.n_episodes} episodes "
++            f"({'deterministic' if eval_cfg.deterministic else 'stochastic'} actions). Space = take over."
++        )
++        results = run_episodes(
++            env, env_processor, action_processor, policy, preprocessor, postprocessor, cfg, eval_cfg
++        )
++        report(results)
++    finally:
++        env.close()
++        if teleop_device is not None and teleop_device.is_connected:
++            teleop_device.disconnect()
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/src/lerobot/rl/gym_manipulator.py b/src/lerobot/rl/gym_manipulator.py
+index 03f7b4ee..a825d761 100644
+--- a/src/lerobot/rl/gym_manipulator.py
++++ b/src/lerobot/rl/gym_manipulator.py
+@@ -17,6 +17,7 @@
+ import logging
+ import time
+ from dataclasses import dataclass
++from datetime import datetime
+ from typing import Any
+ 
+ import gymnasium as gym
+@@ -39,10 +40,13 @@ from lerobot.processor import (
+     GymHILAdapterProcessorStep,
+     ImageCropResizeProcessorStep,
+     InterventionActionProcessorStep,
++    LeaderArmTeleopStep,
++    LeaderJointPassthroughStep,
+     MapDeltaActionToRobotActionStep,
+     MapTensorToDeltaActionDictStep,
+     Numpy2TorchActionProcessorStep,
+     RewardClassifierProcessorStep,
++    StagedRewardProcessorStep,
+     RobotActionToPolicyActionProcessorStep,
+     RobotObservation,
+     TimeLimitProcessorStep,
+@@ -55,6 +59,7 @@ from lerobot.processor import (
+ from lerobot.robots import (  # noqa: F401
+     RobotConfig,
+     make_robot_from_config,
++    so101_sim,
+     so_follower,
+ )
+ from lerobot.robots.robot import Robot
+@@ -77,6 +82,11 @@ from lerobot.utils.constants import ACTION, DONE, OBS_IMAGES, OBS_STATE, REWARD
+ from lerobot.utils.import_utils import require_package
+ from lerobot.utils.robot_utils import precise_sleep
+ from lerobot.utils.utils import log_say
++from lerobot.utils.visualization_utils import (
++    init_visualization,
++    log_visualization_data,
++    shutdown_visualization,
++)
+ 
+ from .joint_observations_processor import JointVelocityProcessorStep, MotorCurrentProcessorStep
+ 
+@@ -93,6 +103,18 @@ class DatasetConfig:
+     num_episodes_to_record: int = 5
+     replay_episode: int | None = None
+     push_to_hub: bool = False
++    # Skip appending the date-time tag to repo_id, keeping the user-provided name as-is
++    no_stamp: bool = False
++
++    def stamp_repo_id(self) -> None:
++        """Append a date-time tag to ``repo_id`` so each recording session gets a unique name.
++
++        Called at dataset creation time only, so replay keeps reading the given ``repo_id``.
++        """
++        if self.no_stamp:
++            return
++        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
++        self.repo_id = f"{self.repo_id}_{timestamp}"
+ 
+ 
+ @dataclass
+@@ -103,6 +125,41 @@ class GymManipulatorConfig:
+     dataset: DatasetConfig
+     mode: str | None = None  # Either "record", "replay", None
+     device: str = "cpu"
++    # Stream cameras, state and action to a viewer while running: "rerun", "foxglove" or None
++    display_mode: str | None = None
++    # Compress images to JPEG before streaming them (less bandwidth and memory, more CPU)
++    display_compressed_images: bool = False
++
++
++def log_transition_visualization(
++    transition: EnvTransition, cfg: GymManipulatorConfig, raw_images: dict[str, np.ndarray] | None = None
++) -> None:
++    """Stream the full-resolution camera frames, the reward signals and the executed action.
++
++    The state vector is left out so the observation plot only shows the reward and the classifier
++    probability. `raw_images` are the full-resolution frames before cropping and resizing.
++    """
++    # Only the full-resolution frames are shown; the 128x128 policy inputs are left out
++    observation = {}
++    for camera, frame in (raw_images or {}).items():
++        observation[f"observation.raw_images.{camera}"] = frame
++
++    # Reward (labeled by the success key or predicted by the reward classifier) as plotted scalars
++    observation["reward"] = float(transition.get(TransitionKey.REWARD) or 0.0)
++    probability = transition[TransitionKey.INFO].get("reward_classifier_probability")
++    if probability is not None:
++        observation["reward_classifier_probability"] = float(probability)
++
++    action = {}
++    executed_action = transition[TransitionKey.COMPLEMENTARY_DATA].get("teleop_action")
++    if isinstance(executed_action, torch.Tensor):
++        values = executed_action.detach().flatten().cpu().numpy()
++        names = ["delta_x", "delta_y", "delta_z", "gripper"] if len(values) == 4 else range(len(values))
++        action = {f"{name}": float(v) for name, v in zip(names, values, strict=True)}
++
++    log_visualization_data(
++        cfg.display_mode, observation=observation, action=action, compress_images=cfg.display_compressed_images
++    )
+ 
+ 
+ def reset_follower_position(robot_arm: Robot, target_position: np.ndarray) -> None:
+@@ -130,6 +187,7 @@ class RobotEnv(gym.Env):
+         display_cameras: bool = False,
+         reset_pose: list[float] | None = None,
+         reset_time_s: float = 5.0,
++        terminate_on_success: bool = True,
+     ) -> None:
+         """Initialize robot environment with configuration options.
+ 
+@@ -139,6 +197,7 @@ class RobotEnv(gym.Env):
+             display_cameras: Whether to show camera feeds during execution.
+             reset_pose: Joint positions for environment reset.
+             reset_time_s: Time to wait during reset.
++            terminate_on_success: End the episode when a simulated robot reports success.
+         """
+         super().__init__()
+ 
+@@ -158,11 +217,13 @@ class RobotEnv(gym.Env):
+ 
+         self.reset_pose = reset_pose
+         self.reset_time_s = reset_time_s
++        self.terminate_on_success = terminate_on_success
+ 
+         self.use_gripper = use_gripper
+ 
+         self._joint_names = list(self.robot.bus.motors.keys())
+         self._raw_joint_positions = None
++        self._raw_images: dict[str, np.ndarray] = {}
+ 
+         self._setup_spaces()
+ 
+@@ -173,6 +234,7 @@ class RobotEnv(gym.Env):
+         joint_positions = np.array([raw_joint_joint_position[f"{name}.pos"] for name in self._joint_names])
+ 
+         images = {key: obs_dict[key] for key in self._image_keys}
++        self._raw_images = images
+ 
+         return {"agent_pos": joint_positions, "pixels": images, **raw_joint_joint_position}
+ 
+@@ -236,7 +298,10 @@ class RobotEnv(gym.Env):
+         # Reset the robot
+         # self.robot.reset()
+         start_time = time.perf_counter()
+-        if self.reset_pose is not None:
++        if hasattr(self.robot, "reset_scene"):
++            # Simulated robots teleport to the reset pose and re-randomize the task objects
++            self.robot.reset_scene(self.reset_pose)
++        elif self.reset_pose is not None:
+             log_say("Reset the environment.", play_sounds=True)
+             reset_follower_position(self.robot, np.array(self.reset_pose))
+             log_say("Reset the environment done.", play_sounds=True)
+@@ -271,6 +336,11 @@ class RobotEnv(gym.Env):
+         terminated = False
+         truncated = False
+ 
++        # Simulated robots know when the task is solved; real robots rely on the classifier or teleop
++        if hasattr(self.robot, "is_success") and self.robot.is_success():
++            reward = 1.0
++            terminated = self.terminate_on_success
++
+         return (
+             obs,
+             reward,
+@@ -300,6 +370,10 @@ class RobotEnv(gym.Env):
+         """Get raw joint positions."""
+         return self._raw_joint_positions
+ 
++    def get_raw_images(self) -> dict[str, np.ndarray]:
++        """Latest camera frames at full resolution, before cropping and resizing (for display)."""
++        return self._raw_images
++
+ 
+ def make_robot_env(cfg: HILSerlRobotEnvConfig) -> tuple[gym.Env, Any]:
+     """Create robot environment from configuration.
+@@ -344,12 +418,16 @@ def make_robot_env(cfg: HILSerlRobotEnvConfig) -> tuple[gym.Env, Any]:
+         cfg.processor.observation.display_cameras if cfg.processor.observation is not None else False
+     )
+     reset_pose = cfg.processor.reset.fixed_reset_joint_positions if cfg.processor.reset is not None else None
++    reset_time_s = cfg.processor.reset.reset_time_s if cfg.processor.reset is not None else 5.0
++    terminate_on_success = cfg.processor.reset.terminate_on_success if cfg.processor.reset is not None else True
+ 
+     env = RobotEnv(
+         robot=robot,
+         use_gripper=use_gripper,
+         display_cameras=display_cameras,
+         reset_pose=reset_pose,
++        reset_time_s=reset_time_s,
++        terminate_on_success=terminate_on_success,
+     )
+ 
+     return env, teleop_device
+@@ -480,12 +558,53 @@ def make_processors(
+             )
+         )
+ 
++    staged = cfg.processor.staged_reward
++    if staged is not None:
++        if kinematics_solver is None:
++            raise ValueError("processor.staged_reward requires processor.inverse_kinematics to be configured")
++        # After the success reward (simulator or classifier), so terminal steps get Φ(s') = 0
++        env_pipeline_steps.append(
++            StagedRewardProcessorStep(
++                kinematics=kinematics_solver,
++                motor_names=motor_names,
++                grasp_reward=staged.grasp_reward,
++                lift_reward=staged.lift_reward,
++                grasp_min_gripper_pos=staged.grasp_min_gripper_pos,
++                lift_height=staged.lift_height,
++                discount=staged.discount,
++            )
++        )
++
+     env_pipeline_steps.append(AddBatchDimensionProcessorStep())
+     env_pipeline_steps.append(DeviceProcessorStep(device=device))
+ 
+     action_pipeline_steps = [
+         AddTeleopActionAsComplimentaryDataStep(teleop_device=teleop_device),
+-        AddTeleopEventsAsInfoStep(teleop_device=teleop_device),
++        # Without termination on success, keep labeling frames as successful once the key is pressed
++        AddTeleopEventsAsInfoStep(teleop_device=teleop_device, latch_success=not terminate_on_success),
++    ]
++
++    # "leader": the follower copies the leader's pose (the leader tracks the follower when idle)
++    # "leader_clutch": the leader's motion since takeover moves the follower, the leader never tracks
++    is_leader = cfg.processor.control_mode in ("leader", "leader_clutch")
++    is_clutch = cfg.processor.control_mode == "leader_clutch"
++    if is_leader:
++        if kinematics_solver is None:
++            raise ValueError(f'control_mode="{cfg.processor.control_mode}" requires processor.inverse_kinematics')
++        # Records the leader's motion as the same EE delta the policy outputs
++        action_pipeline_steps.append(
++            LeaderArmTeleopStep(
++                teleop_device=teleop_device,
++                kinematics=kinematics_solver,
++                motor_names=motor_names,
++                end_effector_step_sizes=cfg.processor.inverse_kinematics.end_effector_step_sizes,
++                max_gripper_pos=cfg.processor.max_gripper_pos or 100.0,
++                use_gripper=cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else False,
++                clutch=is_clutch,
++            )
++        )
++
++    action_pipeline_steps += [
+         InterventionActionProcessorStep(
+             use_gripper=cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else False,
+             terminate_on_success=terminate_on_success,
+@@ -509,16 +628,37 @@ def make_processors(
+             ),
+             EEBoundsAndSafety(
+                 end_effector_bounds=cfg.processor.inverse_kinematics.end_effector_bounds,
++                # Rate-limit (and warn) instead of aborting the loop: an abort mid-episode leaves the
++                # robot uncontrolled, and taking over with the leader arm can legitimately jump once
++                raise_on_jump=False,
+             ),
+             GripperVelocityToJoint(
+                 clip_max=cfg.processor.max_gripper_pos,
+                 speed_factor=1.0,
+                 discrete_gripper=True,
++                # "stay" keeps squeezing after a close command, so a partly closed gripper really
++                # means something is between the jaws (grasp detection, holding force)
++                hold_last_target=True,
+             ),
+             InverseKinematicsRLStep(
+                 kinematics=kinematics_solver, motor_names=motor_names, initial_guess_current_joints=False
+             ),
+         ]
++        if is_leader and not is_clutch:
++            # While intervening, the follower copies the leader's joints like lerobot-teleoperate
++            inverse_kinematics_steps.append(
++                LeaderJointPassthroughStep(
++                    kinematics=kinematics_solver,
++                    motor_names=motor_names,
++                    end_effector_bounds=cfg.processor.inverse_kinematics.end_effector_bounds,
++                    max_gripper_pos=cfg.processor.max_gripper_pos or 100.0,
++                    kinematic_steps=[
++                        step
++                        for step in inverse_kinematics_steps
++                        if isinstance(step, (EEReferenceAndDelta, EEBoundsAndSafety, InverseKinematicsRLStep))
++                    ],
++                )
++            )
+         action_pipeline_steps.extend(inverse_kinematics_steps)
+         action_pipeline_steps.append(RobotActionToPolicyActionProcessorStep(motor_names=motor_names))
+ 
+@@ -631,10 +771,17 @@ def control_loop(
+ 
+     print(f"Starting control loop at {cfg.env.fps} FPS")
+     print("Controls:")
+-    print("- Use gamepad/teleop device for intervention")
++    if cfg.env.processor.control_mode in ("leader", "leader_clutch"):
++        print("- Press Space to take over with the leader arm (and again to release)")
++        print("- Press s for success, Esc for failure, r to re-record")
++    else:
++        print("- Use gamepad/teleop device for intervention")
+     print("- When not intervening, robot will stay still")
+     print("- Press Ctrl+C to exit")
+ 
++    if cfg.display_mode is not None:
++        init_visualization(cfg.display_mode, session_name="gym_manipulator")
++
+     transition = reset_and_build_transition(env, env_processor, action_processor)
+ 
+     # Determine if gripper is used
+@@ -642,7 +789,8 @@ def control_loop(
+ 
+     dataset = None
+     if cfg.mode == "record":
+-        if teleop_device:
++        # A leader arm's teleop action is converted to EE deltas, so it uses the default features
++        if teleop_device and cfg.env.processor.control_mode not in ("leader", "leader_clutch"):
+             action_features = teleop_device.action_features
+         else:
+             action_features = {
+@@ -677,6 +825,8 @@ def control_loop(
+                 }
+ 
+         # Create dataset
++        cfg.dataset.stamp_repo_id()
++        logging.info(f"Recording to dataset {cfg.dataset.repo_id}")
+         dataset = LeRobotDataset.create(
+             cfg.dataset.repo_id,
+             cfg.env.fps,
+@@ -738,6 +888,10 @@ def control_loop(
+                     frame["task"] = cfg.dataset.task
+                     dataset.add_frame(frame)
+ 
++            if cfg.display_mode is not None:
++                raw_images = env.get_raw_images() if hasattr(env, "get_raw_images") else None
++                log_transition_visualization(transition, cfg, raw_images)
++
+             episode_step += 1
+ 
+             # Handle episode termination
+@@ -764,6 +918,8 @@ def control_loop(
+             # Maintain fps timing
+             precise_sleep(max(dt - (time.perf_counter() - step_start_time), 0.0))
+     finally:
++        if cfg.display_mode is not None:
++            shutdown_visualization(cfg.display_mode)
+         if dataset is not None and dataset.writer is not None and dataset.writer.image_writer is not None:
+             logging.info("Waiting for image writer to finish...")
+             dataset.writer.image_writer.stop()
+@@ -806,18 +962,23 @@ def replay_trajectory(
+ def main(cfg: GymManipulatorConfig) -> None:
+     """Main entry point for gym manipulator script."""
+     env, teleop_device = make_robot_env(cfg.env)
+-    env_processor, action_processor = make_processors(env, teleop_device, cfg.env, cfg.device)
++    try:
++        env_processor, action_processor = make_processors(env, teleop_device, cfg.env, cfg.device)
+ 
+-    print("Environment observation space:", env.observation_space)
+-    print("Environment action space:", env.action_space)
+-    print("Environment processor:", env_processor)
+-    print("Action processor:", action_processor)
++        print("Environment observation space:", env.observation_space)
++        print("Environment action space:", env.action_space)
++        print("Environment processor:", env_processor)
++        print("Action processor:", action_processor)
+ 
+-    if cfg.mode == "replay":
+-        replay_trajectory(env, action_processor, cfg)
+-        exit()
++        if cfg.mode == "replay":
++            replay_trajectory(env, action_processor, cfg)
++            return
+ 
+-    control_loop(env, env_processor, action_processor, teleop_device, cfg)
++        control_loop(env, env_processor, action_processor, teleop_device, cfg)
++    finally:
++        env.close()
++        if teleop_device.is_connected:
++            teleop_device.disconnect()
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/src/lerobot/rl/learner.py b/src/lerobot/rl/learner.py
+index b694e138..c008ce77 100644
+--- a/src/lerobot/rl/learner.py
++++ b/src/lerobot/rl/learner.py
+@@ -46,7 +46,6 @@ https://github.com/michel-aractingi/lerobot-hilserl-guide
+ 
+ import logging
+ import os
+-import shutil
+ import time
+ from concurrent.futures import ThreadPoolExecutor
+ from pathlib import Path
+@@ -83,8 +82,10 @@ from lerobot.common.wandb_utils import WandBLogger
+ from lerobot.configs import parser
+ from lerobot.datasets import LeRobotDataset, make_dataset
+ from lerobot.optim import load_optimizer_state
++from lerobot.model.kinematics import RobotKinematics
+ from lerobot.policies import make_policy, make_pre_post_processors
+-from lerobot.robots import so_follower  # noqa: F401
++from lerobot.processor.hil_processor import staged_shaping_for_trajectories
++from lerobot.robots import so101_sim, so_follower  # noqa: F401
+ from lerobot.teleoperators import gamepad, so_leader  # noqa: F401
+ from lerobot.teleoperators.utils import TeleopEvents
+ from lerobot.transport.utils import (
+@@ -95,15 +96,15 @@ from lerobot.transport.utils import (
+ )
+ from lerobot.utils.constants import (
+     ACTION,
++    OBS_STATE,
+     ALGORITHM_DIR,
+     CHECKPOINTS_DIR,
+     LAST_CHECKPOINT_LINK,
+-    PRETRAINED_MODEL_DIR,
+     TRAINING_STATE_DIR,
+     TRAINING_STEP,
+ )
+ from lerobot.utils.device_utils import get_safe_torch_device
+-from lerobot.utils.io_utils import load_json, write_json
++from lerobot.utils.io_utils import load_json
+ from lerobot.utils.process import ProcessSignalHandler, ensure_multiprocessing_start_method
+ from lerobot.utils.random_utils import load_rng_state, set_seed
+ from lerobot.utils.utils import (
+@@ -145,6 +146,7 @@ def train(cfg: TrainRLServerPipelineConfig, job_name: str | None = None):
+         job_name (str | None, optional): Job name for logging. Defaults to None.
+     """
+ 
++    cfg.set_run_dir("learner")
+     cfg.validate()
+ 
+     if job_name is None:
+@@ -385,11 +387,28 @@ def add_actor_information_and_train(
+     if cfg.dataset is not None:
+         dataset_repo_id = cfg.dataset.repo_id
+ 
++    def save_checkpoint_now() -> None:
++        save_training_checkpoint(
++            cfg=cfg,
++            optimization_step=optimization_step,
++            online_steps=online_steps,
++            policy=policy,
++            optimizers=optimizers,
++            preprocessor=preprocessor,
++            postprocessor=postprocessor,
++        )
++
++    last_saved_step = optimization_step
++
+     # NOTE: THIS IS THE MAIN LOOP OF THE LEARNER
+     while True:
+         # Exit the training loop if shutdown is requested
+         if shutdown_event is not None and shutdown_event.is_set():
+             logging.info("[LEARNER] Shutdown signal received. Exiting...")
++            # Keep the progress made since the last periodic checkpoint, so the run can be resumed
++            if saving_checkpoint and optimization_step > last_saved_step:
++                logging.info(f"[LEARNER] Saving checkpoint at step {optimization_step} before exiting")
++                save_checkpoint_now()
+             break
+ 
+         # Process all available transitions to the replay buffer, send by the actor server
+@@ -459,21 +478,8 @@ def add_actor_information_and_train(
+ 
+         # Save checkpoint at specified intervals
+         if saving_checkpoint and should_save_checkpoint(optimization_step, save_freq, online_steps):
+-            save_training_checkpoint(
+-                cfg=cfg,
+-                optimization_step=optimization_step,
+-                online_steps=online_steps,
+-                interaction_message=interaction_message,
+-                policy=policy,
+-                optimizers=optimizers,
+-                replay_buffer=replay_buffer,
+-                algorithm=algorithm,
+-                offline_replay_buffer=offline_replay_buffer,
+-                dataset_repo_id=dataset_repo_id,
+-                fps=fps,
+-                preprocessor=preprocessor,
+-                postprocessor=postprocessor,
+-            )
++            save_checkpoint_now()
++            last_saved_step = optimization_step
+ 
+ 
+ def start_learner(
+@@ -550,50 +556,28 @@ def save_training_checkpoint(
+     cfg: TrainRLServerPipelineConfig,
+     optimization_step: int,
+     online_steps: int,
+-    interaction_message: dict | None,
+     policy: nn.Module,
+     optimizers: dict[str, Optimizer],
+-    replay_buffer: ReplayBuffer,
+-    algorithm: RLAlgorithm | None = None,
+-    offline_replay_buffer: ReplayBuffer | None = None,
+-    dataset_repo_id: str | None = None,
+-    fps: int = 30,
+     preprocessor=None,
+     postprocessor=None,
+ ) -> None:
+     """
+-    Save training checkpoint and associated data.
++    Save the policy for evaluation/deployment.
+ 
+-    This function performs the following steps:
+-    1. Creates a checkpoint directory with the current optimization step
+-    2. Saves the policy model, configuration, and optimizer states
+-    3. Saves the current interaction step for resuming training
+-    4. Updates the "last" checkpoint symlink to point to this checkpoint
+-    5. Saves the replay buffer as a dataset for later use
+-    6. If an offline replay buffer exists, saves it as a separate dataset
++    Resuming is not supported, so only the policy, its configs and its pre/post-processors are
++    written (`pretrained_model/`); the replay buffers and the critics are not saved.
+ 
+     Args:
+         cfg: Training configuration
+         optimization_step: Current optimization step
+         online_steps: Total number of online steps
+-        interaction_message: Dictionary containing interaction information
+         policy: Policy model to save
+         optimizers: Dictionary of optimizers
+-        replay_buffer: Replay buffer to save as dataset
+-        offline_replay_buffer: Optional offline replay buffer to save
+-        dataset_repo_id: Repository ID for dataset
+-        fps: Frames per second for dataset
+         preprocessor: Optional preprocessor pipeline to save
+         postprocessor: Optional postprocessor pipeline to save
+     """
+     logging.info(f"Checkpoint policy after step {optimization_step}")
+-    _num_digits = max(6, len(str(online_steps)))
+-    interaction_step = interaction_message["Interaction step"] if interaction_message is not None else 0
+-
+-    # Create checkpoint directory
+     checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, online_steps, optimization_step)
+-
+-    # Save policy artifacts (pretrained_model/) + Trainer scaffolding (training_state/).
+     save_checkpoint(
+         checkpoint_dir=checkpoint_dir,
+         step=optimization_step,
+@@ -604,107 +588,39 @@ def save_training_checkpoint(
+         preprocessor=preprocessor,
+         postprocessor=postprocessor,
+     )
+-
+-    # Algorithm-owned tensors live in their own component subfolder
+-    # so they can be `push_to_hub`'d independently and don't bloat the inference artifact.
+-    if algorithm is not None:
+-        algorithm.save_pretrained(checkpoint_dir / ALGORITHM_DIR)
+-
+-    # Enrich training_step.json with the RL-specific interaction_step counter so
+-    # both can be restored from a single file.
+-    training_state_dir = checkpoint_dir / TRAINING_STATE_DIR
+-    write_json(
+-        {"step": optimization_step, "interaction_step": interaction_step},
+-        training_state_dir / TRAINING_STEP,
+-    )
+-
+-    # Update the "last" symlink
+     update_last_checkpoint(checkpoint_dir)
+ 
+-    # TODO : temporary save replay buffer here, remove later when on the robot
+-    # We want to control this with the keyboard inputs
+-    dataset_dir = os.path.join(cfg.output_dir, "dataset")
+-    if os.path.exists(dataset_dir) and os.path.isdir(dataset_dir):
+-        shutil.rmtree(dataset_dir)
+-
+-    # Save dataset
+-    # NOTE: Handle the case where the dataset repo id is not specified in the config
+-    # eg. RL training without demonstrations data
+-    repo_id_buffer_save = cfg.env.task if dataset_repo_id is None else dataset_repo_id
+-    replay_buffer.to_lerobot_dataset(repo_id=repo_id_buffer_save, fps=fps, root=dataset_dir)
+-
+-    if offline_replay_buffer is not None:
+-        dataset_offline_dir = os.path.join(cfg.output_dir, "dataset_offline")
+-        if os.path.exists(dataset_offline_dir) and os.path.isdir(dataset_offline_dir):
+-            shutil.rmtree(dataset_offline_dir)
+-
+-        offline_replay_buffer.to_lerobot_dataset(
+-            cfg.dataset.repo_id,
+-            fps=fps,
+-            root=dataset_offline_dir,
+-        )
+-
+-    logging.info("Resume training")
+-
+ 
+ # Training setup functions
+ 
+ 
+ def handle_resume_logic(cfg: TrainRLServerPipelineConfig) -> TrainRLServerPipelineConfig:
+     """
+-    Handle the resume logic for training.
++    Reject resuming and refuse to overwrite an existing run.
+ 
+-    If resume is True:
+-    - Verifies that a checkpoint exists
+-    - Loads the checkpoint configuration
+-    - Logs resumption details
+-    - Returns the checkpoint configuration
+-
+-    If resume is False:
+-    - Checks if an output directory exists (to prevent accidental overwriting)
+-    - Returns the original configuration
++    Checkpoints only contain the policy (no replay buffers, critics or optimizer state), so a run
++    cannot be resumed; a new run always starts from scratch.
+ 
+     Args:
+         cfg (TrainRLServerPipelineConfig): The training configuration
+ 
+     Returns:
+-        TrainRLServerPipelineConfig: The updated configuration
++        TrainRLServerPipelineConfig: The unchanged configuration
+ 
+     Raises:
+-        RuntimeError: If resume is True but no checkpoint found, or if resume is False but directory exists
++        ValueError: If resume is requested.
++        RuntimeError: If the output directory already holds a checkpoint.
+     """
+-    out_dir = cfg.output_dir
+-
+-    # Case 1: Not resuming, but need to check if directory exists to prevent overwrites
+-    if not cfg.resume:
+-        checkpoint_dir = os.path.join(out_dir, CHECKPOINTS_DIR, LAST_CHECKPOINT_LINK)
+-        if os.path.exists(checkpoint_dir):
+-            raise RuntimeError(
+-                f"Output directory {checkpoint_dir} already exists. Use `resume=true` to resume training."
+-            )
+-        return cfg
+-
+-    # Case 2: Resuming training
+-    checkpoint_dir = os.path.join(out_dir, CHECKPOINTS_DIR, LAST_CHECKPOINT_LINK)
+-    if not os.path.exists(checkpoint_dir):
+-        raise RuntimeError(f"No model checkpoint found in {checkpoint_dir} for resume=True")
+-
+-    # Log that we found a valid checkpoint and are resuming
+-    logging.info(
+-        colored(
+-            "Valid checkpoint found: resume=True detected, resuming previous run",
+-            color="yellow",
+-            attrs=["bold"],
++    if cfg.resume:
++        raise ValueError(
++            "Resuming a HIL-SERL run is not supported: checkpoints only contain the policy. "
++            "Start a new run with resume=false."
+         )
+-    )
+ 
+-    # Load config using Draccus
+-    checkpoint_cfg_path = os.path.join(checkpoint_dir, PRETRAINED_MODEL_DIR, "train_config.json")
+-    checkpoint_cfg = TrainRLServerPipelineConfig.from_pretrained(checkpoint_cfg_path)
+-
+-    # Ensure resume flag is set in returned config
+-    checkpoint_cfg.resume = True
+-    return checkpoint_cfg
++    checkpoint_dir = os.path.join(cfg.output_dir, CHECKPOINTS_DIR, LAST_CHECKPOINT_LINK)
++    if os.path.exists(checkpoint_dir):
++        raise RuntimeError(f"Output directory {checkpoint_dir} already exists. Use a new output_dir.")
++    return cfg
+ 
+ 
+ def load_training_state(
+@@ -869,9 +785,42 @@ def initialize_offline_replay_buffer(
+         optimize_memory=True,
+         capacity=cfg.policy.offline_buffer_capacity,
+     )
++    if cfg.env is not None and getattr(cfg.env, "processor", None) is not None:
++        if cfg.env.processor.staged_reward is not None:
++            add_staged_rewards_to_buffer(cfg, offline_replay_buffer)
+     return offline_replay_buffer
+ 
+ 
++def add_staged_rewards_to_buffer(cfg: TrainRLServerPipelineConfig, buffer: ReplayBuffer) -> None:
++    """Add the grasp/lift shaping to recorded demonstrations, as the actor does online.
++
++    Demonstrations carry only the sparse success reward; without this, the same transition would
++    be rewarded differently offline and online. Joint positions are the first motors of
++    `observation.state` (robot units, gripper last) and the gripper command is the last action.
++    """
++    staged = cfg.env.processor.staged_reward
++    ik = cfg.env.processor.inverse_kinematics
++    kinematics = RobotKinematics(urdf_path=ik.urdf_path, target_frame_name=ik.target_frame_name)
++    n_joints = len(kinematics.joint_names)
++    size = len(buffer)
++    shaping = staged_shaping_for_trajectories(
++        joint_positions=buffer.states[OBS_STATE][:size, :n_joints].cpu().numpy(),
++        gripper_commands=buffer.actions[:size, -1].cpu().numpy(),
++        dones=(buffer.dones[:size] | buffer.truncateds[:size]).cpu().numpy(),
++        kinematics=kinematics,
++        grasp_min_gripper_pos=staged.grasp_min_gripper_pos,
++        lift_height=staged.lift_height,
++        grasp_reward=staged.grasp_reward,
++        lift_reward=staged.lift_reward,
++        discount=staged.discount,
++    )
++    buffer.rewards[:size] += torch.from_numpy(shaping).to(buffer.rewards.device)
++    logging.info(
++        f"Staged reward added to {size} offline transitions: {int((shaping > 1e-6).sum())} rewarded, "
++        f"{int((shaping < -1e-6).sum())} penalized"
++    )
++
++
+ # Utilities/Helpers functions
+ 
+ 
+diff --git a/src/lerobot/rl/train_rl.py b/src/lerobot/rl/train_rl.py
+index e5ae0f9f..41636349 100644
+--- a/src/lerobot/rl/train_rl.py
++++ b/src/lerobot/rl/train_rl.py
+@@ -16,7 +16,9 @@
+ 
+ from __future__ import annotations
+ 
++import datetime as dt
+ from dataclasses import dataclass
++from pathlib import Path
+ 
+ from lerobot.configs.default import DatasetConfig
+ from lerobot.configs.train import TrainPipelineConfig
+@@ -40,6 +42,30 @@ class TrainRLServerPipelineConfig(TrainPipelineConfig):
+     # Fraction sampled from online replay when using OnlineOfflineMixer.
+     online_ratio: float = 0.5
+ 
++    # Actor-side live view of cameras (processed and raw), reward and executed action: "rerun",
++    # "foxglove" or None
++    display_mode: str | None = None
++    # Compress images to JPEG before streaming them (less bandwidth and memory, more CPU)
++    display_compressed_images: bool = False
++
++    # Probability, per actor step, of trying to close the gripper while it is open. The policy never
++    # explores the gripper otherwise (it takes the argmax of the discrete critic); random opening is
++    # not used since it would drop held objects. 0 disables it.
++    discrete_action_epsilon: float = 0.0
++
++    # When set (and `output_dir` is not), the learner and the actor each write to their own run
++    # directory in here: `<timestamp>_learner_<name>` / `<timestamp>_actor_<name>`, where `<name>` is
++    # `job_name` without its `hilserl_` prefix.
++    runs_dir: str | None = None
++
++    def set_run_dir(self, role: str) -> None:
++        """Pick `output_dir` for the learner or the actor process (call before `validate`)."""
++        if self.output_dir is not None or self.runs_dir is None:
++            return
++        name = (self.job_name or "hilserl").removeprefix("hilserl_")
++        timestamp = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
++        self.output_dir = Path(self.runs_dir) / f"{timestamp}_{role}_{name}"
++
+     def validate(self) -> None:
+         super().validate()
+ 
+@@ -48,3 +74,11 @@ class TrainRLServerPipelineConfig(TrainPipelineConfig):
+ 
+         if getattr(self.algorithm, "policy_config", None) is None:
+             self.algorithm.policy_config = self.policy
++
++        # Potential-based shaping only preserves the optimal policy with the RL discount
++        staged = getattr(getattr(self.env, "processor", None), "staged_reward", None)
++        discount = getattr(self.algorithm, "discount", None)
++        if staged is not None and discount is not None and abs(staged.discount - discount) > 1e-9:
++            raise ValueError(
++                f"env.processor.staged_reward.discount ({staged.discount}) must equal algorithm.discount ({discount})"
++            )
+diff --git a/src/lerobot/robots/so_follower/robot_kinematic_processor.py b/src/lerobot/robots/so_follower/robot_kinematic_processor.py
+index 98bb54f6..1dde71e2 100644
+--- a/src/lerobot/robots/so_follower/robot_kinematic_processor.py
++++ b/src/lerobot/robots/so_follower/robot_kinematic_processor.py
+@@ -387,12 +387,17 @@ class GripperVelocityToJoint(RobotActionProcessorStep):
+         clip_max: The maximum allowed gripper joint position.
+         discrete_gripper: If True, interpret the input as a discrete class index
+             {0 = close, 1 = stay, 2 = open}, matching `GamepadTeleop.GripperAction`.
++        hold_last_target: In discrete mode, "stay" keeps the last commanded target instead of the
++            measured position. A closed gripper then keeps squeezing (it only stops short of fully
++            closed when an object blocks it), rather than freezing wherever it happens to be.
+     """
+ 
+     speed_factor: float = 20.0
+     clip_min: float = 0.0
+     clip_max: float = 100.0
+     discrete_gripper: bool = False
++    hold_last_target: bool = False
++    _last_target: float | None = field(default=None, init=False, repr=False)
+ 
+     def action(self, action: RobotAction) -> RobotAction:
+         raw_observation = self.transition.get(TransitionKey.OBSERVATION)
+@@ -421,10 +426,17 @@ class GripperVelocityToJoint(RobotActionProcessorStep):
+         delta = gripper_vel * float(self.speed_factor)
+         # TODO: This assumes gripper is the last specified joint in the robot
+         gripper_pos = float(np.clip(q_raw[-1] + delta, self.clip_min, self.clip_max))
++        if self.discrete_gripper and self.hold_last_target:
++            if delta != 0 or self._last_target is None:
++                self._last_target = gripper_pos
++            gripper_pos = self._last_target
+         action["ee.gripper_pos"] = gripper_pos
+ 
+         return action
+ 
++    def reset(self) -> None:
++        self._last_target = None
++
+     def transform_features(
+         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+     ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+diff --git a/src/lerobot/scripts/lerobot_find_joint_limits.py b/src/lerobot/scripts/lerobot_find_joint_limits.py
+index b269eeef..8a528c7e 100644
+--- a/src/lerobot/scripts/lerobot_find_joint_limits.py
++++ b/src/lerobot/scripts/lerobot_find_joint_limits.py
+@@ -35,6 +35,7 @@ lerobot-find-joint-limits \
+ ```
+ """
+ 
++import json
+ import time
+ from dataclasses import dataclass
+ 
+@@ -103,7 +104,8 @@ def find_joint_and_ee_bounds(cfg: FindJointLimitsConfig):
+ 
+     # Initialize Kinematics
+     try:
+-        kinematics = RobotKinematics(cfg.urdf_path, cfg.target_frame_name)
++        # Same joint order as the motors (and as gym_manipulator), whatever the URDF declares
++        kinematics = RobotKinematics(cfg.urdf_path, cfg.target_frame_name, joint_names=list(robot.bus.motors))
+     except Exception as e:
+         print(f"Error initializing kinematics: {e}")
+         print("Ensure URDF path and target frame name are correct.")
+@@ -211,10 +213,13 @@ def find_joint_and_ee_bounds(cfg: FindJointLimitsConfig):
+         print(f"max_ee = {r_max_ee}")
+         print(f"min_ee = {r_min_ee}")
+ 
+-        print("\n# Joint Position Limits (radians):")
++        print("\n# Joint Position Limits (robot units, degrees when use_degrees=true):")
+         print(f"max_pos = {r_max_pos}")
+         print(f"min_pos = {r_min_pos}")
+ 
++        print("\n# Ready to paste as processor.inverse_kinematics.end_effector_bounds:")
++        print(json.dumps({"min": r_min_ee, "max": r_max_ee}))
++
+     else:
+         print("No data recorded (exited during warmup).")
+ 
+diff --git a/src/lerobot/teleoperators/keyboard/__init__.py b/src/lerobot/teleoperators/keyboard/__init__.py
+index c6b123b7..d2a04601 100644
+--- a/src/lerobot/teleoperators/keyboard/__init__.py
++++ b/src/lerobot/teleoperators/keyboard/__init__.py
+@@ -16,16 +16,19 @@
+ 
+ from .configuration_keyboard import (
+     KeyboardEndEffectorTeleopConfig,
++    KeyboardHILTeleopConfig,
+     KeyboardRoverTeleopConfig,
+     KeyboardTeleopConfig,
+ )
+-from .teleop_keyboard import KeyboardEndEffectorTeleop, KeyboardRoverTeleop, KeyboardTeleop
++from .teleop_keyboard import KeyboardEndEffectorTeleop, KeyboardHILTeleop, KeyboardRoverTeleop, KeyboardTeleop
+ 
+ __all__ = [
+     "KeyboardTeleopConfig",
+     "KeyboardTeleop",
+     "KeyboardEndEffectorTeleopConfig",
+     "KeyboardEndEffectorTeleop",
++    "KeyboardHILTeleopConfig",
++    "KeyboardHILTeleop",
+     "KeyboardRoverTeleopConfig",
+     "KeyboardRoverTeleop",
+ ]
+diff --git a/src/lerobot/teleoperators/keyboard/configuration_keyboard.py b/src/lerobot/teleoperators/keyboard/configuration_keyboard.py
+index 15871743..ad2771f2 100644
+--- a/src/lerobot/teleoperators/keyboard/configuration_keyboard.py
++++ b/src/lerobot/teleoperators/keyboard/configuration_keyboard.py
+@@ -42,6 +42,26 @@ class KeyboardEndEffectorTeleopConfig(KeyboardTeleopConfig):
+     use_gripper: bool = True
+ 
+ 
++@TeleoperatorConfig.register_subclass("keyboard_hil")
++@dataclass
++class KeyboardHILTeleopConfig(KeyboardEndEffectorTeleopConfig):
++    """Keyboard end-effector intervention device for HIL-SERL.
++
++    Space toggles the intervention (the arm holds still while no key is pressed), the mouse (or the
++    arrow keys) moves in the front-camera image plane, Shift moves along z, Ctrl closes/opens the
++    gripper, and s / Esc / r mark success / failure / re-record.
++    """
++
++    # Move in the x-y plane with the mouse while intervening (arrow keys keep working)
++    use_mouse_xy: bool = True
++    # Mouse travel, in screen pixels per control step, that commands a full end-effector step
++    mouse_pixels_per_step: float = 30.0
++    # Direction the operator looks along, as an azimuth in the robot base frame (degrees, 0 = +x,
++    # 90 = +y). Screen-up (mouse up / Up arrow) moves the arm that way, screen-right 90° clockwise of
++    # it. 0 = standing behind the robot looking out; 180 = the real front camera looking back at it.
++    view_azimuth_deg: float = 0.0
++
++
+ @TeleoperatorConfig.register_subclass("keyboard_rover")
+ @dataclass
+ class KeyboardRoverTeleopConfig(TeleoperatorConfig):
+diff --git a/src/lerobot/teleoperators/keyboard/teleop_keyboard.py b/src/lerobot/teleoperators/keyboard/teleop_keyboard.py
+index 8c60b659..f85b4e9e 100644
+--- a/src/lerobot/teleoperators/keyboard/teleop_keyboard.py
++++ b/src/lerobot/teleoperators/keyboard/teleop_keyboard.py
+@@ -15,10 +15,13 @@
+ # limitations under the License.
+ 
+ import logging
++import threading
+ import time
+ from queue import Queue
+ from typing import Any
+ 
++import numpy as np
++
+ from lerobot.lerobot_types import RobotAction
+ from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
+ from lerobot.utils.import_utils import _pynput_available, require_package
+@@ -28,15 +31,17 @@ from ..teleoperator import Teleoperator
+ from ..utils import TeleopEvents
+ from .configuration_keyboard import (
+     KeyboardEndEffectorTeleopConfig,
++    KeyboardHILTeleopConfig,
+     KeyboardRoverTeleopConfig,
+     KeyboardTeleopConfig,
+ )
+ 
+ PYNPUT_AVAILABLE = _pynput_available
+ keyboard = None
++mouse = None
+ if PYNPUT_AVAILABLE:
+     try:
+-        from pynput import keyboard
++        from pynput import keyboard, mouse
+     except Exception as e:
+         PYNPUT_AVAILABLE = False
+         logging.info("Could not import pynput keyboard backend: %s", e)
+@@ -285,6 +290,125 @@ class KeyboardEndEffectorTeleop(KeyboardTeleop):
+         }
+ 
+ 
++class KeyboardHILTeleop(KeyboardEndEffectorTeleop):
++    """Keyboard intervention device for HIL-SERL, in place of a leader arm.
++
++    Unlike `KeyboardEndEffectorTeleop` (intervening only while a movement key is held), Space toggles
++    the intervention like with the leader arm, so the policy cannot grab control back between two
++    key presses: while intervening and no key is pressed, the arm holds still.
++
++    The mouse (and the arrow keys) move in the plane of the table as seen by the operator:
++    screen-up moves along `view_azimuth_deg`, screen-right 90° clockwise of it. Mouse motion is
++    proportional: `mouse_pixels_per_step` pixels within one control step give a full step.
++    Left / right Shift move down / up, left / right Ctrl close / open the gripper.
++    s = success, Esc = failure, r = re-record.
++    """
++
++    config_class = KeyboardHILTeleopConfig
++    name = "keyboard_hil"
++
++    def __init__(self, config: KeyboardHILTeleopConfig):
++        super().__init__(config)
++        self.is_intervention = False
++        self.control_events = Queue()
++        self.mouse_listener = None
++        self._mouse_lock = threading.Lock()
++        self._mouse_last: tuple[float, float] | None = None
++        self._mouse_motion = [0.0, 0.0]
++
++    def connect(self) -> None:
++        super().connect()
++        if self.config.use_mouse_xy and self.listener is not None and mouse is not None:
++            self.mouse_listener = mouse.Listener(on_move=self._on_move)
++            self.mouse_listener.start()
++            logging.info("Mouse x-y control enabled while intervening.")
++
++    def disconnect(self) -> None:
++        if self.mouse_listener is not None:
++            self.mouse_listener.stop()
++            self.mouse_listener = None
++        super().disconnect()
++
++    def _on_move(self, x, y):
++        with self._mouse_lock:
++            if self._mouse_last is not None:
++                self._mouse_motion[0] += x - self._mouse_last[0]
++                self._mouse_motion[1] += y - self._mouse_last[1]
++            self._mouse_last = (x, y)
++
++    def _take_mouse_motion(self) -> tuple[float, float]:
++        """Screen-pixel motion since the last call (right, down)."""
++        with self._mouse_lock:
++            dx, dy = self._mouse_motion
++            self._mouse_motion = [0.0, 0.0]
++        return dx, dy
++
++    def _on_press(self, key):
++        if key == keyboard.Key.space:
++            self.is_intervention = not self.is_intervention
++            # Motion made before taking over must not turn into a jump
++            self._take_mouse_motion()
++            logging.info(f"Intervention {'ON' if self.is_intervention else 'OFF'}")
++            return
++        if key == keyboard.Key.esc:
++            self.control_events.put(TeleopEvents.TERMINATE_EPISODE)
++            return
++        char = getattr(key, "char", None)
++        if char == "s":
++            self.control_events.put(TeleopEvents.SUCCESS)
++        elif char == "r":
++            self.control_events.put(TeleopEvents.RERECORD_EPISODE)
++        else:
++            self.event_queue.put((key, True))
++
++    def _on_release(self, key):
++        # Esc ends the episode here; it must not disconnect the keyboard like in the parent class
++        self.event_queue.put((key, False))
++
++    @check_if_not_connected
++    def get_action(self) -> RobotAction:
++        self._drain_pressed_keys()
++        pressed = {key for key, is_pressed in self.current_pressed.items() if is_pressed}
++
++        def axis(negative, positive) -> float:
++            return float((positive in pressed) - (negative in pressed))
++
++        screen_up = axis(keyboard.Key.down, keyboard.Key.up)
++        screen_right = axis(keyboard.Key.left, keyboard.Key.right)
++        mouse_right, mouse_down = self._take_mouse_motion()
++        if self.is_intervention:
++            screen_up -= mouse_down / self.config.mouse_pixels_per_step
++            screen_right += mouse_right / self.config.mouse_pixels_per_step
++
++        # Screen axes -> robot base frame: up = (cos a, sin a), right = (sin a, -cos a)
++        azimuth = np.deg2rad(self.config.view_azimuth_deg)
++        delta_x = screen_up * np.cos(azimuth) + screen_right * np.sin(azimuth)
++        delta_y = screen_up * np.sin(azimuth) - screen_right * np.cos(azimuth)
++
++        action = {
++            "delta_x": float(np.clip(delta_x, -1.0, 1.0)),
++            "delta_y": float(np.clip(delta_y, -1.0, 1.0)),
++            "delta_z": axis(keyboard.Key.shift, keyboard.Key.shift_r),
++        }
++        if self.config.use_gripper:
++            # Discrete command as consumed by GripperVelocityToJoint on SO101 (and recorded by the
++            # leader arm): 0 raises the position (opens), 1 stays, 2 lowers it (closes)
++            action["gripper"] = 1.0 + axis(keyboard.Key.ctrl_r, keyboard.Key.ctrl_l)
++        return action
++
++    def get_teleop_events(self) -> dict[str, Any]:
++        events = set()
++        while not self.control_events.empty():
++            events.add(self.control_events.get_nowait())
++        rerecord = TeleopEvents.RERECORD_EPISODE in events
++        return {
++            TeleopEvents.IS_INTERVENTION: self.is_intervention,
++            TeleopEvents.TERMINATE_EPISODE: rerecord or TeleopEvents.TERMINATE_EPISODE in events,
++            TeleopEvents.SUCCESS: TeleopEvents.SUCCESS in events,
++            TeleopEvents.RERECORD_EPISODE: rerecord,
++        }
++
++
+ class KeyboardRoverTeleop(KeyboardTeleop):
+     """
+     Keyboard teleoperator for mobile robots like EarthRover Mini Plus.
+@@ -434,3 +558,63 @@ class KeyboardRoverTeleop(KeyboardTeleop):
+             "linear_velocity": linear_velocity,
+             "angular_velocity": angular_velocity,
+         }
++
++
++class KeyboardTeleopEvents:
++    """Keyboard episode controls for teleoperators without buttons (e.g. a leader arm in HIL-SERL).
++
++    Key bindings follow the HIL-SERL docs:
++    - Space: toggle intervention (take over / give control back to the policy)
++    - s: mark the episode as a success
++    - Esc: terminate the episode as a failure
++    - r: re-record the episode
++    """
++
++    def __init__(self):
++        self.listener = None
++        self.event_queue = Queue()
++        self.is_intervention = False
++
++    def start(self) -> None:
++        if self.listener is not None:
++            return
++        if not (PYNPUT_AVAILABLE and pynput_can_capture()):
++            logging.warning(
++                "Keyboard events are unavailable in this environment (pynput needs an X11 session on "
++                "Linux). Intervention, success and failure keys will not work."
++            )
++            return
++        self.listener = keyboard.Listener(on_press=self._on_press)
++        self.listener.start()
++        logging.info("Keyboard events enabled: Space=intervention, s=success, Esc=failure, r=re-record")
++
++    def stop(self) -> None:
++        if self.listener is not None:
++            self.listener.stop()
++            self.listener = None
++
++    def _on_press(self, key) -> None:
++        if key == keyboard.Key.space:
++            self.is_intervention = not self.is_intervention
++            logging.info(f"Intervention {'ON' if self.is_intervention else 'OFF'}")
++        elif key == keyboard.Key.esc:
++            self.event_queue.put(TeleopEvents.TERMINATE_EPISODE)
++        elif getattr(key, "char", None) == "s":
++            self.event_queue.put(TeleopEvents.SUCCESS)
++        elif getattr(key, "char", None) == "r":
++            self.event_queue.put(TeleopEvents.RERECORD_EPISODE)
++
++    def get_events(self) -> dict[str, Any]:
++        self.start()
++        pressed = set()
++        while not self.event_queue.empty():
++            pressed.add(self.event_queue.get_nowait())
++
++        success = TeleopEvents.SUCCESS in pressed
++        rerecord = TeleopEvents.RERECORD_EPISODE in pressed
++        return {
++            TeleopEvents.IS_INTERVENTION: self.is_intervention,
++            TeleopEvents.TERMINATE_EPISODE: rerecord or TeleopEvents.TERMINATE_EPISODE in pressed,
++            TeleopEvents.SUCCESS: success,
++            TeleopEvents.RERECORD_EPISODE: rerecord,
++        }
+diff --git a/src/lerobot/teleoperators/so_leader/so_leader.py b/src/lerobot/teleoperators/so_leader/so_leader.py
+index 99f0ee40..2941b4e1 100644
+--- a/src/lerobot/teleoperators/so_leader/so_leader.py
++++ b/src/lerobot/teleoperators/so_leader/so_leader.py
+@@ -16,6 +16,7 @@
+ 
+ import logging
+ import time
++from typing import Any
+ 
+ from lerobot.motors import Motor, MotorCalibration, MotorNormMode
+ from lerobot.motors.feetech import (
+@@ -24,6 +25,7 @@ from lerobot.motors.feetech import (
+ )
+ from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
+ 
++from ..keyboard.teleop_keyboard import KeyboardTeleopEvents
+ from ..teleoperator import Teleoperator
+ from .config_so_leader import SOLeaderTeleopConfig
+ 
+@@ -52,6 +54,7 @@ class SOLeader(Teleoperator):
+             },
+             calibration=self.calibration,
+         )
++        self._keyboard_events: KeyboardTeleopEvents | None = None
+ 
+     @property
+     def action_features(self) -> dict[str, type]:
+@@ -131,10 +134,10 @@ class SOLeader(Teleoperator):
+             self.bus.write("Operating_Mode", motor, OperatingMode.POSITION.value)
+ 
+     def enable_torque(self) -> None:
+-        self.bus.enable_torque()
++        self.bus.enable_torque(num_retry=self.config.num_read_retries)
+ 
+     def disable_torque(self) -> None:
+-        self.bus.disable_torque()
++        self.bus.disable_torque(num_retry=self.config.num_read_retries)
+ 
+     def setup_motors(self) -> None:
+         for motor in reversed(self.bus.motors):
+@@ -157,8 +160,16 @@ class SOLeader(Teleoperator):
+         if goals:
+             self.bus.sync_write("Goal_Position", goals)
+ 
++    def get_teleop_events(self) -> dict[str, Any]:
++        """Keyboard episode controls used when the leader arm is the HIL-SERL intervention device."""
++        if self._keyboard_events is None:
++            self._keyboard_events = KeyboardTeleopEvents()
++        return self._keyboard_events.get_events()
++
+     @check_if_not_connected
+     def disconnect(self) -> None:
++        if self._keyboard_events is not None:
++            self._keyboard_events.stop()
+         self.bus.disconnect()
+         logger.info(f"{self} disconnected.")
+ 
+diff --git a/src/lerobot/teleoperators/utils.py b/src/lerobot/teleoperators/utils.py
+index 0f0eaf07..8085380d 100644
+--- a/src/lerobot/teleoperators/utils.py
++++ b/src/lerobot/teleoperators/utils.py
+@@ -67,6 +67,10 @@ def make_teleoperator_from_config(config: TeleoperatorConfig) -> "Teleoperator":
+         from .keyboard.teleop_keyboard import KeyboardEndEffectorTeleop
+ 
+         return KeyboardEndEffectorTeleop(config)
++    elif config.type == "keyboard_hil":
++        from .keyboard.teleop_keyboard import KeyboardHILTeleop
++
++        return KeyboardHILTeleop(config)
+     elif config.type == "homunculus_glove":
+         from .homunculus import HomunculusGlove
+ 
