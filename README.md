@@ -57,6 +57,8 @@
 
 ## 0. 安装
 
+### 0.1 安装依赖
+
 原实验环境：Ubuntu，Python 3.12，PyTorch 2.11 + CUDA 13.0，MuJoCo 3.8.1，placo 0.9.15，gym-hil 0.1.14（完整版本见 `extras/environment/pip_freeze.txt`）。
 
 ```bash
@@ -68,6 +70,24 @@ cd lerobot               # 以下所有命令都在这里执行
 ```
 
 配置里的 `Simulation/SO101/...`、`outputs/...` 都是相对 `lerobot/` 根目录的路径。
+
+### 0.2 验证安装
+
+```bash
+pip install pytest
+pytest tests/rl/test_so101_mujoco.py -v
+```
+
+运行 24 个单元测试，检查 MuJoCo 仿真环境与网络代码是否正常，全部显示 `PASSED` 即安装成功（约 10 秒，不训练模型、不需要真机）。测试内容包括：
+
+- 环境：reset 后状态为 18 维，末端位移指令能移动机械臂，夹爪开 / 不动 / 关的语义
+- 奖励：取值范围与回合截断，抬起比拖动得分高，越界惩罚，方块放进圆圈并松开才算成功
+- 域随机化：物理参数按环境独立随机且可还原，动作延迟、关节读数噪声、相机延迟生效
+- 网络与部署：教师 / 学生网络的输入输出维度，部署前的 env 配置一致性检查
+
+若显示 `SKIPPED`，说明 `mujoco` 或 `placo` 没有装好；若有 `FAILED`，多半是依赖版本与原实验环境不一致，可对照 `extras/environment/pip_freeze.txt`。这些测试只覆盖仿真部分，真机相关功能需要按下面的说明接好硬件后再验证。
+
+### 0.3 硬件与配置准备
 
 **只用仿真时**无需任何硬件；leader 臂接管需要一个 SO101 leader（或把 `teleop` 改成 `keyboard_hil`）。
 
@@ -225,12 +245,6 @@ python -m lerobot.rl.so101_mujoco.eval --checkpoint outputs/so101_mujoco/student
 python -m lerobot.rl.so101_mujoco.deploy --headless true --n_episodes 50        # 仿真，默认 student_realcam.pt
 python -m lerobot.rl.so101_mujoco.deploy --env_config src/lerobot/configs/env_config_so101_deploy_hires.json \
     --action_scale 0.5 --n_episodes 3                                            # 真机，建议先降低动作幅度
-```
-
-## 4. 测试
-
-```bash
-pytest tests/rl/test_so101_mujoco.py -v
 ```
 
 ## 致谢与许可
