@@ -224,7 +224,7 @@ env:
   - 320
   wrist_roll_step_deg: 10.0
   xml_path: Simulation/SO101/so101_new_calib.xml
-init_checkpoint: outputs/so101_mujoco/student_hires.pt
+init_checkpoint: null
 max_iterations: 300
 num_envs: 16
 num_workers: 4

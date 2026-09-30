@@ -229,7 +229,7 @@ ppo:
   num_mini_batches: 4
   num_steps_per_env: 64
   value_loss_coef: 1.0
-resume: outputs/so101_mujoco/teacher_robust_best.pt
+resume: null
 save_interval: 100
 seed: 0
 wandb: false
